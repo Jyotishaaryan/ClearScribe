@@ -1,0 +1,157 @@
+---
+title: Preferences
+sidebar_position: 4
+---
+
+Open the Preferences window from the Menu bar, or click `Ctrl/Cmd + ,`.
+
+## General Preferences
+
+### OpenAI API preferences
+
+**API Key** - key to authenticate your requests to OpenAI API. To get API key from OpenAI see [this article](https://help.openai.com/en/articles/4936850-where-do-i-find-my-openai-api-key).
+
+**Base URL** - By default all requests are sent to API provided by OpenAI company. Their API URL is `https://api.openai.com/v1/`. Compatible APIs are also provided by other companies. List of available API URLs and services to run yourself are available on [discussion page](https://github.com/chidiwilliams/buzz/discussions/827)
+
+**Reduce GPU RAM** - Will slightly compressed model versions for Huggingface, Faster Whisper and Whisper.cpp transcriptions to reduce required GPU memory. Same as `BUZZ_REDUCE_GPU_MEMORY` advanced preference.
+
+### Default export file name
+
+Sets the default export file name for file transcriptions. For
+example, a value of `{{ input_file_name }} ({{ task }}d on {{ date_time }})` will save TXT exports
+as `Input Filename (transcribed on 19-Sep-2023 20-39-25).txt` by default.
+
+Available variables:
+
+| Key               | Description                               | Example                                                          |
+| ----------------- | ----------------------------------------- | ---------------------------------------------------------------- |
+| `input_file_name` | File name of the imported file            | `audio` (e.g. if the imported file path was `/path/to/audio.wav` |
+| `task`            | Transcription task                        | `transcribe`, `translate`                                        |
+| `language`        | Language code                             | `en`, `fr`, `yo`, etc.                                           |
+| `model_type`      | Model type                                | `Whisper`, `Whisper.cpp`, `Faster Whisper`, etc.                 |
+| `model_size`      | Model size                                | `tiny`, `base`, `small`, `medium`, `large`, etc.                 |
+| `date_time`       | Export time (format: `%d-%b-%Y %H-%M-%S`) | `19-Sep-2023 20-39-25`                                           |
+
+### Live transcript exports
+
+Live transcription export can be used to integrate Buzz with other applications like OBS Studio.
+When enabled, live text transcripts will be exported to a text file as they get generated and translated.
+
+If AI translation is enabled for live recordings, the translated text will also be exported to the text file.
+Filename for the translated text will end with `.translated.txt`.
+
+### Live transcription mode
+
+Three transcription modes are available:
+
+**Append below** - New sentences will be added below existing with an empty space between them.
+Last sentence will be at the bottom.
+
+**Append above** - New sentences will be added above existing with an empty space between them.
+Last sentence will be at the top.
+
+**Append and correct** - New sentences will be added at the end of existing transcript without extra spaces between.
+This mode will also try to correct errors at the end of previously transcribed sentences. This mode requires more
+processing power and more powerful hardware to work.
+
+## Model Preferences
+
+This section lets you download new models for transcription and delete unused ones.
+
+For Whisper.cpp you can also add any number of custom models. Enter a name and then either
+add a model file that is already on your computer or download one from a URL to its `.bin`
+file (use the link from the "download" button on Huggingface). Each custom model appears by
+name in the model list so you can switch between them. See
+[Custom Whisper.cpp models](./custom_whisper_cpp_models.md) for details. This feature is available since 1.4.6.
+
+To improve transcription speed and memory usage you can select a quantized version of some 
+larger model. For example `q_5` version. Whisper.cpp base models in different quantizations are [available here](https://huggingface.co/ggerganov/whisper.cpp/tree/main). See also [custom models](https://github.com/chidiwilliams/buzz/discussions/866) discussion page for custom models in different languages.
+
+[![Model preferences](https://raw.githubusercontent.com/chidiwilliams/buzz/main/share/screenshots/buzz-3.2-model-preferences.png)](https://www.loom.com/share/cf263b099ac3481082bb56d19b7c87fe "Model preferences")
+
+## Folder Watch Preferences
+
+Folder watch lets Buzz transcribe audio and video files automatically. Buzz watches a folder and
+transcribes every new media file that appears in it, while Buzz is running.
+
+**Enable folder watch** - Turns folder watch on or off. The other options are available only when it is enabled.
+
+**Input folder** - Folder to watch for new files. Subfolders are watched too. Hidden files and folders are ignored.
+Buzz waits until a file has stopped changing for about 30 seconds before transcribing it, so files
+that are still being copied are not transcribed too early.
+
+**Output folder** - Folder where transcripts are saved. After transcription the original file is
+moved here as well, so it is not transcribed again. The subfolder structure of the input folder is
+kept. The output folder cannot be the input folder or a subfolder of it.
+
+**Delete processed files** - Deletes the original file after transcription instead of moving it to
+the output folder. Audio playback will not be available for these transcriptions.
+
+**Transcription options** - Model, task, language and export formats to use for the files found in
+the watched folder. They work the same way as for a regular file transcription.
+
+**Speaker identification** - When enabled, speakers are identified after transcription and speaker
+labels are added to the exported transcripts. Transcription will take longer.
+
+## Advanced Preferences
+
+To keep preferences section simple for new users, some more advanced preferences are settable via OS environment variables. Set the necessary environment variables in your OS before starting Buzz or create a script to set them.
+
+On MacOS and Linux crete `run_buzz.sh` with the following content:
+
+```bash
+#!/bin/bash
+export VARIABLE=value
+export SOME_OTHER_VARIABLE=some_other_value
+buzz
+```
+
+On Windows crete `run_buzz.bat` with the following content:
+
+```bat
+@echo off
+set VARIABLE=value
+set SOME_OTHER_VARIABLE=some_other_value
+"C:\Program Files (x86)\Buzz\Buzz.exe"
+```
+
+Alternatively you can set environment variables in your OS settings. See [this guide](https://phoenixnap.com/kb/windows-set-environment-variable#ftoc-heading-4) or [this video](https://www.youtube.com/watch?v=bEroNNzqlF4) more information.
+
+### Available variables
+
+**BUZZ_WHISPERCPP_N_THREADS** - Number of threads to use for Whisper.cpp model. Default is half of available CPU cores.
+
+On a laptop with 16 threads setting `BUZZ_WHISPERCPP_N_THREADS=8` leads to some 15% speedup in transcription time.
+Increasing number of threads even more will lead in slower transcription time as results from parallel threads has to be
+combined to produce the final answer.
+
+**BUZZ_TRANSLATION_API_BASE_URL** - Base URL of OpenAI compatible API to use for translation.
+
+**BUZZ_TRANSLATION_API_KEY** - Api key of OpenAI compatible API to use for translation.
+
+**BUZZ_MODEL_ROOT** - Root directory to store model files. You may also want to set `HF_HOME` to the same folder as some libraries used in Buzz download their models independently. 
+Defaults to [user_cache_dir](https://pypi.org/project/platformdirs/).
+
+**BUZZ_FAVORITE_LANGUAGES** - Coma separated list of supported language codes to show on top of language list.
+
+**BUZZ_DOWNLOAD_COOKIEFILE** - Location of a [cookiefile](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp) to use for downloading private videos or as workaround for anti-bot protection.
+
+**BUZZ_FORCE_CPU** - Will force Buzz to use CPU and not GPU, useful for setups with older GPU if that is slower than GPU or GPU has issues. Example usage `BUZZ_FORCE_CPU=true`.
+
+**BUZZ_REDUCE_GPU_MEMORY** - Will use 8bit quantization for Huggingface, Faster Whisper and Whisper.cpp transcriptions to reduce required GPU memory. Example usage `BUZZ_REDUCE_GPU_MEMORY=true`. Available since `1.4.0`
+
+**BUZZ_MERGE_REGROUP_RULE** - Custom regroup merge rule to use when combining transcripts with word-level timings. More information on available options [in stable-ts repo](https://github.com/jianfch/stable-ts?tab=readme-ov-file#regrouping-methods). 
+
+**BUZZ_DISABLE_TELEMETRY** - Buzz collects basic OS name and architecture usage statistics to better focus development efforts. This variable lets disable collection of these statistics. Example usage `BUZZ_DISABLE_TELEMETRY=true`.
+
+**BUZZ_DISABLE_UPDATE_CHECK** - Disable checks for updates. Example usage `BUZZ_DISABLE_UPDATE_CHECK=true`. Available since `1.4.5`
+
+**BUZZ_UPLOAD_URL** - Live recording transcripts and translations can be uploaded to a server for display on the web. Set this variable to the desired upload url. You can use [buzz-transcription-server](https://github.com/raivisdejus/buzz-transcription-server) as a server. Buzz will upload the following `json` via `POST` requests - `{"kind": "transcript", "text": "Sample transcript"}` or `{"kind": "translation", "text": "Sample translation"}`. Example usage `BUZZ_UPLOAD_URL=http://localhost:5000/upload`. 
+
+**HF_ENDPOINT** - To speed up downloads in China set `HF_ENDPOINT=https://hf-mirror.com` 
+
+Example of data collected by telemetry:
+```
+Buzz: 1.3.0, locale: ('lv_LV', 'UTF-8'), system: Linux, release: 6.14.0-27-generic, machine: x86_64, version: #27~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Jul 22 17:38:49 UTC 2,
+```
+**BUZZ_PARAGRAPH_SPLIT_TIME** - Time in milliseconds of silence to split paragraphs in transcript and add two newlines when exporting the transcripts as text. Default is `2000` or 2 seconds.

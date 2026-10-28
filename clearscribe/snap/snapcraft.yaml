@@ -1,0 +1,286 @@
+# Development notes:
+# - To build the snap run `snapcraft clean` and `snapcraft pack --verbose`
+# - To install local snap `snap install ./buzz_*.snap --dangerous`
+# - Add permissions
+# sudo snap connect buzz:audio-record :audio-record
+# sudo snap connect buzz:removable-media :removable-media
+# sudo snap connect buzz:password-manager-service :password-manager-service
+
+# The private shared-memory plug auto-connects; verify with `snap connections buzz`.
+# If it shows as not connected: sudo snap connect buzz:shared-memory
+name: buzz
+base: core24
+version: git
+title: Buzz
+summary: Buzz, offline audio transcription and translation
+website: https://github.com/chidiwilliams/buzz
+source-code: https://github.com/chidiwilliams/buzz
+issues: https://github.com/chidiwilliams/buzz/issues
+contact: https://github.com/chidiwilliams
+description: |
+  Buzz transcribes and translates audio to text offline using OpenAI's Whisper.
+  Import audio and video files into Buzz and export them as TXT, SRT, or VTT files.
+  Buzz supports Whisper, Whisper.cpp, Faster Whisper, Whisper-compatible models
+  from the Hugging Face repository, and the OpenAI Whisper API.
+grade: stable
+confinement: strict
+license: MIT
+icon: buzz/assets/buzz.svg
+
+platforms:
+  amd64:
+
+parts:
+  alsa-pulseaudio:
+    plugin: dump
+    source: .
+    override-pull: |
+      mkdir etc -p
+      cat > etc/asound.conf <<EOF
+      pcm.!default {
+          type pulse
+          fallback "sysdefault"
+          hint {
+              show on
+              description "Default ALSA Output (currently PulseAudio Sound Server)"
+          }
+      }
+      ctl.!default {
+          type pulse
+          fallback "sysdefault"
+      }
+      EOF
+    organize:
+      etc/asound.conf: etc/asound.conf
+    stage:
+      - etc/asound.conf
+    prime:
+      - etc/asound.conf
+
+  portaudio:
+    after: [ alsa-pulseaudio ]
+    plugin: autotools
+    source: https://files.portaudio.com/archives/pa_stable_v190700_20210406.tgz
+    build-packages:
+      - libasound2-dev
+      - libpulse-dev
+    autotools-configure-parameters:
+      - --enable-shared
+      - --disable-static
+    stage:
+      - usr/local/lib/libportaudio*
+    prime:
+      - usr/local/lib/libportaudio*
+
+  python313:
+    plugin: nil
+    build-snaps:
+      - astral-uv
+    build-environment:
+      - UV_NO_CACHE: "true"
+      - UV_HTTP_TIMEOUT: "120"
+    override-build: |
+      # core24 (Ubuntu 24.04) only ships Python 3.12, but Buzz requires 3.13,
+      # so provision a standalone CPython 3.13 into the snap payload.
+      uv python install --no-bin --install-dir "$CRAFT_PART_BUILD/python" 3.13
+      src="$(ls -d "$CRAFT_PART_BUILD"/python/cpython-3.13.*-linux-* | head -n1)"
+      mkdir -p "$CRAFT_PART_INSTALL/usr"
+      cp -a "$src/bin" "$src/lib" "$src/include" "$CRAFT_PART_INSTALL/usr/"
+      # The venv gets its own site-packages, the bundled pip is not needed
+      rm -f "$CRAFT_PART_INSTALL"/usr/bin/pip*
+    stage:
+      - usr/bin/python*
+      - usr/include/python3.13
+      - usr/lib/libpython*
+      - usr/lib/python3.13
+    prime:
+      - usr/bin/python*
+      - usr/lib/libpython*
+      - usr/lib/python3.13
+      - -usr/lib/python3.13/test
+      - -usr/lib/python3.13/idlelib
+      - -usr/lib/python3.13/tkinter
+      - -usr/lib/python3.13/turtledemo
+      - -usr/lib/python3.13/ensurepip
+      - -usr/lib/python3.13/pydoc_data
+      - -usr/lib/python3.13/site-packages
+      - -usr/lib/python3.13/config-*
+
+  buzz:
+    after: [ alsa-pulseaudio, portaudio, python313 ]
+    plugin: nil
+    source: .
+    build-snaps:
+      - astral-uv
+    stage-snaps:
+      - astral-uv
+    build-packages:
+      - wget
+      - portaudio19-dev
+      - qt6-declarative-dev
+      - qt6-multimedia-dev
+      - libvulkan-dev
+      - ccache
+      - cmake
+      - python3
+    build-environment:
+      # Build against the CPython 3.13 provisioned by the python313 part
+      - UV_PYTHON: $CRAFT_STAGE/usr/bin/python3.13
+      # The gnome extension puts the SDK's Debian-patched setuptools (built for
+      # the base's 3.12) on PYTHONPATH, and it leaks into uv's isolated sdist
+      # build environments, where it shadows the clean setuptools and fails with
+      # "AttributeError: install_layout" (seen building nemo's wget dependency).
+      - PYTHONPATH: ""
+      - UV_PYTHON_PREFERENCE: only-system
+      - UV_PYTHON_DOWNLOADS: never
+      - VIRTUAL_ENV: $CRAFT_PART_INSTALL
+      - UV_PROJECT_ENVIRONMENT: $CRAFT_PART_INSTALL
+      - UV_COMPILE_BYTECODE: "1"
+      - UV_FROZEN: "true"
+      - UV_NO_CACHE: "true"
+      - UV_HTTP_TIMEOUT: "120"
+    stage-packages:
+      - libgcc-s1
+      - libc6
+      - libproxy1v5
+      # Audio
+      - ffmpeg
+      - libpulse0
+      - libasound2t64
+      - libasound2-dev
+      - libasound2-plugins
+      - libasound2-plugins-extra
+      - libyaml-dev
+      - liboss4-salsa2
+      # Display
+      - libxkbcommon-x11-0
+      - libxcb-icccm4
+      - libxcb-image0
+      - libxcb-keysyms1
+      - libxcb-randr0
+      - libxcb-render-util0
+      - libxcb-xinerama0
+      - libxcb-shape0
+      - libxcb-cursor0
+      # GPU
+      - libglu1-mesa
+      - libvulkan1
+      - mesa-vulkan-drivers
+    override-build: |
+      wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | tee /etc/apt/trusted.gpg.d/lunarg.asc
+      wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list http://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+      apt update
+      apt install -y vulkan-sdk
+
+      # Clear cache to save space on CI
+      apt clean
+
+      # Build the virtual environment in place (the uv plugin cannot be used
+      # because it hardcodes the base's Python 3.12 for core24)
+      uv venv --relocatable --allow-existing --python "$UV_PYTHON" "$CRAFT_PART_INSTALL"
+      uv sync --no-dev --no-editable --reinstall
+
+      # Point the venv interpreter at the one shipped in the snap
+      ln -sf ../usr/bin/python3.13 "$CRAFT_PART_INSTALL/bin/python"
+      ln -sf python "$CRAFT_PART_INSTALL/bin/python3"
+      ln -sf python "$CRAFT_PART_INSTALL/bin/python3.13"
+      sed -i "s|^home = .*|home = /snap/buzz/current/usr/bin|" "$CRAFT_PART_INSTALL/pyvenv.cfg"
+
+      # Clean caches
+      uv cache clean
+
+      # Create launcher wrapper to ensure the snap's own portaudio and libasound are found
+      # before gnome content snap libraries (which desktop-launch prepends to LD_LIBRARY_PATH)
+      mkdir -p $CRAFT_PART_INSTALL/bin
+      cat > $CRAFT_PART_INSTALL/bin/buzz-launcher <<'LAUNCHER'
+      #!/bin/sh
+      export LD_LIBRARY_PATH="$SNAP/usr/local/lib:$SNAP/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+
+      # desktop-launch puts the gnome platform snap's Python 3.12 stdlib and
+      # dist-packages on PYTHONPATH. PYTHONPATH is searched before the
+      # interpreter's own stdlib, so our Python 3.13 would import 3.12's re,
+      # importlib, ... and die with "SRE module mismatch". Drop those entries;
+      # nothing in Buzz can use modules built for another ABI anyway.
+      clean_pythonpath=""
+      IFS=":"
+      for entry in $PYTHONPATH; do
+          case "$entry" in
+              ""|*/gnome-platform/usr/lib/python3*) continue ;;
+          esac
+          clean_pythonpath="${clean_pythonpath:+$clean_pythonpath:}$entry"
+      done
+      unset IFS
+      export PYTHONPATH="$clean_pythonpath"
+
+      exec "$SNAP/bin/python" -m buzz "$@"
+      LAUNCHER
+      sed -i 's/^      //' $CRAFT_PART_INSTALL/bin/buzz-launcher
+      chmod +x $CRAFT_PART_INSTALL/bin/buzz-launcher
+
+      # Copy source files
+      cp -r $CRAFT_PART_BUILD/buzz $CRAFT_PART_INSTALL/
+      cp -r $CRAFT_PART_BUILD/ctc_forced_aligner $CRAFT_PART_INSTALL/
+      cp -r $CRAFT_PART_BUILD/deepmultilingualpunctuation $CRAFT_PART_INSTALL/
+      cp -r $CRAFT_PART_BUILD/whisper_diarization $CRAFT_PART_INSTALL/
+
+      # Create desktop file
+      mkdir -p $CRAFT_PART_INSTALL/usr/share/applications
+      cp $CRAFT_PART_BUILD/Buzz.desktop $CRAFT_PART_INSTALL/usr/share/applications/
+    stage:
+      - '*'
+    prime:
+      - '*'
+
+  gpu-2404:
+    after: [ buzz ]
+    source: https://github.com/canonical/gpu-snap.git
+    plugin: dump
+    override-prime: |
+      craftctl default
+      ${CRAFT_PART_SRC}/bin/gpu-2404-cleanup mesa-2404
+      # Workaround for https://bugs.launchpad.net/snapd/+bug/2055273
+      mkdir -p "${CRAFT_PRIME}/gpu-2404"
+    prime:
+      - bin/gpu-2404-wrapper
+
+apps:
+  buzz:
+    extensions:
+      - gnome
+    command-chain:
+      - bin/gpu-2404-wrapper
+    command: snap/command-chain/desktop-launch $SNAP/bin/buzz-launcher
+    desktop: usr/share/applications/Buzz.desktop
+    environment:
+      PATH: $SNAP/usr/bin:$SNAP/bin:$PATH
+      LD_LIBRARY_PATH: $SNAP/usr/local/lib:$SNAP/lib/python3.13/site-packages/nvidia/cudnn/lib:$SNAP/lib/python3.13/site-packages/PyQt6:$SNAP/lib/python3.13/site-packages/PyQt6/Qt6/lib:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/lapack:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/blas:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/oss4-libsalsa:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/libproxy:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/alsa-lib:$SNAP:$LD_LIBRARY_PATH
+      PYTHONPATH: $SNAP:$SNAP/lib/python3.13/site-packages/PyQt6:$SNAP/lib/python3.13/site-packages/PyQt6/Qt6/lib:$SNAP/usr/lib/python3.13/site-packages:$SNAP/usr/local/lib/python3.13/dist-packages:$SNAP/usr/lib/python3.13/dist-packages:$PYTHONPATH
+      QT_MEDIA_BACKEND: ffmpeg
+      PULSE_LATENCY_MSEC: "30"
+      ALSA_CONFIG_PATH: $SNAP/etc/asound.conf
+    plugs:
+      - x11
+      - unity7
+      - wayland
+      - home
+      - network
+      - network-bind
+      - desktop
+      - desktop-legacy
+      - gsettings
+      - opengl
+      - removable-media
+      - audio-playback
+      - audio-record
+      # Fallback for keyring support if secrets portal is missing, user has to connect this manually
+      - password-manager-service
+      # For multiprocessing queues to work
+      - shared-memory
+
+plugs:
+  shared-memory:
+    private: true
+
+layout:
+  /usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/alsa-lib:
+    bind: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/alsa-lib

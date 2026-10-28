@@ -1,0 +1,997 @@
+import re
+import os
+import logging
+import ssl
+import time
+import random
+from contextlib import contextmanager
+from typing import Optional
+
+from PyQt6 import sip
+
+# Fix SSL certificate verification for bundled applications (macOS, Windows)
+# This must be done before importing libraries that download from Hugging Face
+try:
+    import certifi
+    os.environ.setdefault('REQUESTS_CA_BUNDLE', certifi.where())
+    os.environ.setdefault('SSL_CERT_FILE', certifi.where())
+    os.environ.setdefault('SSL_CERT_DIR', os.path.dirname(certifi.where()))
+    # Also update the default SSL context for urllib
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    pass
+
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import (
+    QWidget,
+    QFormLayout,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QCheckBox,
+    QRadioButton,
+    QButtonGroup,
+    QComboBox,
+    QGroupBox,
+    QSpacerItem,
+    QSizePolicy,
+    QLayout,
+)
+from buzz.locale import _
+from buzz.db.entity.transcription import Transcription
+from buzz.db.service.transcription_service import TranscriptionService
+from buzz.paths import file_path_as_title
+from buzz.settings.settings import Settings
+from buzz.sounddevice_player import AudioFilePlayer
+from buzz.widgets.line_edit import LineEdit
+from buzz.transcriber.transcriber import Segment
+from buzz.transcriber.speaker_identifier import build_speaker_segments
+
+
+
+# Longest speaker sample played by the "Play sample" button
+MAX_PREVIEW_DURATION_MS = 10 * 1000
+
+
+def process_in_batches(
+    items,
+    process_func,
+    batch_size=200,
+    chunk_size=230,
+    smaller_batch_size=100,
+    exception_types=(AssertionError,),
+    **process_func_kwargs
+):
+    """
+    Process items in batches with automatic fallback to smaller batches on errors.
+    
+    This is a generic batch processing function that can be used with any processing
+    function that has chunk size limitations. It automatically retries with smaller
+    batches when specified exceptions occur.
+    
+    Args:
+        items: List of items to process
+        process_func: Callable that processes a batch. Should accept (batch, chunk_size, **kwargs)
+                      and return a list of results
+        batch_size: Initial batch size (default: 200)
+        chunk_size: Maximum chunk size for the processing function (default: 230)
+        smaller_batch_size: Fallback batch size when errors occur (default: 100)
+        exception_types: Tuple of exception types to catch and retry with smaller batches
+                        (default: (AssertionError,))
+        **process_func_kwargs: Additional keyword arguments to pass to process_func
+        
+    Returns:
+        List of processed results (concatenated from all batches)
+        
+    Example:
+        >>> def my_predict(batch, chunk_size):
+        ...     return [f"processed_{item}" for item in batch]
+        >>> results = process_in_batches(
+        ...     items=["a", "b", "c"],
+        ...     process_func=my_predict,
+        ...     batch_size=2
+        ... )
+    """
+    all_results = []
+
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i + batch_size]
+        try:
+            batch_results = process_func(batch, chunk_size=min(chunk_size, len(batch)), **process_func_kwargs)
+            all_results.extend(batch_results)
+        except exception_types as e:
+            # If batch still fails, try with even smaller chunks
+            logging.warning(f"Batch processing failed, trying smaller chunks: {e}")
+            for j in range(0, len(batch), smaller_batch_size):
+                smaller_batch = batch[j:j + smaller_batch_size]
+                smaller_results = process_func(smaller_batch, chunk_size=min(chunk_size, len(smaller_batch)), **process_func_kwargs)
+                all_results.extend(smaller_results)
+
+    return all_results
+
+@contextmanager
+def hide_cuda_from_torch(device):
+    """Make ``torch.cuda.is_available()`` report False while running on CPU.
+
+    The NeMo diarizers take their device from their config, which defaults to
+    ``null`` and so resolves to CUDA whenever it is available - the weights are
+    loaded onto the GPU before the ``device`` we pass is ever applied. On GPUs
+    that are too old for the shipped CUDA kernels that fails with
+    "no kernel image is available for execution on the device", so hide CUDA
+    for the duration of the call instead.
+    """
+    import torch
+
+    if device != "cpu" or not torch.cuda.is_available():
+        yield
+        return
+
+    original_is_available = torch.cuda.is_available
+    torch.cuda.is_available = lambda: False
+    try:
+        yield
+    finally:
+        torch.cuda.is_available = original_is_available
+
+
+class IdentificationWorker(QObject):
+    finished = pyqtSignal(list)
+    progress_update = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        transcription,
+        transcription_service,
+        diarizer="msdd",
+        num_speakers: Optional[int] = None,
+        segments: Optional[list] = None,
+        file_path: Optional[str] = None,
+        language: Optional[str] = None,
+    ):
+        super().__init__()
+        self.transcription = transcription
+        self.transcription_service = transcription_service
+        self.diarizer = diarizer
+        self.num_speakers = num_speakers
+        # Optional overrides so the worker can run on transcripts that are not
+        # (yet) stored in the database, such as folder watch transcriptions.
+        self.segments = segments
+        self.file_path = file_path
+        self.language = language
+        self._is_cancelled = False
+
+    def cancel(self):
+        """Request cancellation of the worker."""
+        self._is_cancelled = True
+
+    def _get_segments(self):
+        if self.transcription is None:
+            return self.segments or []
+        return self.transcription_service.get_transcription_segments(
+            transcription_id=self.transcription.id_as_uuid
+        )
+
+    def _get_audio_file(self) -> str:
+        if self.transcription is None:
+            return self.file_path
+        return self.transcription.file
+
+    def _get_language(self) -> Optional[str]:
+        # Empty when the language was auto-detected; callers fall back to "en"
+        if self.transcription is None:
+            return self.language
+        return self.transcription.language
+
+    def _import_libraries(self):
+        from ctc_forced_aligner.ctc_forced_aligner import (
+            generate_emissions,
+            get_alignments,
+            get_spans,
+            load_alignment_model,
+            postprocess_results,
+            preprocess_text,
+        )
+        from whisper_diarization.helpers import (
+            get_realigned_ws_mapping_with_punctuation,
+            get_sentences_speaker_mapping,
+            get_words_speaker_mapping,
+            langs_to_iso,
+            punct_model_langs,
+        )
+        from deepmultilingualpunctuation.deepmultilingualpunctuation import PunctuationModel
+        from whisper_diarization.diarization import MSDDDiarizer, SortformerDiarizer
+
+        # Store on the instance so the other worker methods can access them.
+        # (Local imports here would otherwise be out of scope elsewhere.)
+        self._generate_emissions = generate_emissions
+        self._get_alignments = get_alignments
+        self._get_spans = get_spans
+        self._load_alignment_model = load_alignment_model
+        self._postprocess_results = postprocess_results
+        self._preprocess_text = preprocess_text
+        self._get_realigned_ws_mapping_with_punctuation = get_realigned_ws_mapping_with_punctuation
+        self._get_sentences_speaker_mapping = get_sentences_speaker_mapping
+        self._get_words_speaker_mapping = get_words_speaker_mapping
+        self._langs_to_iso = langs_to_iso
+        self._punct_model_langs = punct_model_langs
+        self._PunctuationModel = PunctuationModel
+        self._MSDDDiarizer = MSDDDiarizer
+        self._SortformerDiarizer = SortformerDiarizer
+
+    def _get_transcript_data(self):
+        import faster_whisper
+
+        language = self._get_language() or "en"
+
+        segments = self._get_segments()
+
+        full_transcript = " ".join(segment.text for segment in segments)
+        full_transcript = re.sub(r' {2,}', ' ', full_transcript)
+
+        audio_waveform = faster_whisper.decode_audio(self._get_audio_file())
+        return language, full_transcript, audio_waveform
+
+    def _setup_device(self):
+        import torch
+
+        # "Disable GPU" in Preferences exports BUZZ_FORCE_CPU, but read the setting too
+        # so the preference applies even if the environment was not updated.
+        force_cpu = (
+            os.getenv("BUZZ_FORCE_CPU", "false").lower() == "true"
+            or Settings().value(Settings.Key.FORCE_CPU, False)
+        )
+        use_cuda = torch.cuda.is_available() and not force_cpu
+        device = "cuda" if use_cuda else "cpu"
+        torch_dtype = torch.float16 if use_cuda else torch.float32
+
+        logging.debug(f"Speaker identification worker: Using device={device}")
+        return device, torch_dtype
+
+    def _load_alignment_model_with_retry(self, device, torch_dtype):
+        alignment_model = None
+        alignment_tokenizer = None
+        for attempt in range(3):
+            try:
+                alignment_model, alignment_tokenizer = self._load_alignment_model(
+                    device,
+                    dtype=torch_dtype,
+                )
+                break
+            except Exception as e:
+                if attempt < 2:
+                    logging.warning(
+                        f"Speaker identification: Failed to load alignment model "
+                        f"(attempt {attempt + 1}/3), retrying: {e}"
+                    )
+                    # On retry, try using cached models only (offline mode)
+                    # Set at runtime by modifying the library constants directly
+                    # (env vars are only read at import time)
+                    try:
+                        import huggingface_hub.constants
+                        huggingface_hub.constants.HF_HUB_OFFLINE = True
+                        logging.debug("Speaker identification: Enabled HF offline mode")
+                    except Exception as offline_err:
+                        logging.warning(f"Failed to set offline mode: {offline_err}")
+                    self.progress_update.emit(
+                        _("3/8 Loading alignment model (retrying with cache...)")
+                    )
+                    time.sleep(2 ** attempt)  # 1s, 2s backoff
+                else:
+                    raise RuntimeError(
+                        _("Failed to load alignment model. "
+                          "Please check your internet connection and try again.")
+                    ) from e
+        return alignment_model, alignment_tokenizer
+
+    def _generate_emissions_and_cleanup(self, alignment_model, audio_waveform, device):
+        import torch
+
+        try:
+            emissions, stride = self._generate_emissions(
+                alignment_model,
+                torch.from_numpy(audio_waveform)
+                .to(alignment_model.dtype)
+                .to(alignment_model.device),
+                batch_size=1 if device == "cpu" else 8,
+            )
+            return emissions, stride
+        finally:
+            del alignment_model
+            torch.cuda.empty_cache()
+
+    def _get_word_timestamps(self, full_transcript, language, emissions, stride, alignment_tokenizer):
+        tokens_starred, text_starred = self._preprocess_text(
+            full_transcript,
+            romanize=True,
+            language=self._langs_to_iso[language],
+        )
+
+        segments, scores, blank_token = self._get_alignments(
+            emissions,
+            tokens_starred,
+            alignment_tokenizer,
+        )
+
+        spans = self._get_spans(tokens_starred, segments, blank_token)
+
+        word_timestamps = self._postprocess_results(text_starred, spans, stride, scores)
+        return word_timestamps
+
+    def _run_diarization(self, audio_waveform, device):
+        import torch
+
+        # Silence NeMo's verbose logging
+        logging.getLogger("nemo_logging").setLevel(logging.ERROR)
+        try:
+            from nemo.utils import logging as nemo_logging
+            nemo_logging.setLevel(logging.ERROR)
+        except (ImportError, AttributeError):
+            pass
+
+        logging.debug(
+            "Speaker identification worker: Creating diarizer model (%s)", self.diarizer
+        )
+        diarizer_model = None
+        try:
+            with hide_cuda_from_torch(device):
+                logging.debug(
+                    "Speaker identification worker: Running diarization "
+                    "(this may take a while on CPU)"
+                )
+                if self.diarizer == "sortformer":
+                    diarizer_model = self._SortformerDiarizer(device)
+                    speaker_ts = diarizer_model.diarize(
+                        torch.from_numpy(audio_waveform).unsqueeze(0)
+                    )
+                else:
+                    diarizer_model = self._MSDDDiarizer(device)
+                    speaker_ts = diarizer_model.diarize(
+                        torch.from_numpy(audio_waveform).unsqueeze(0),
+                        num_speakers=self.num_speakers,
+                    )
+            logging.debug("Speaker identification worker: Diarization complete")
+            return speaker_ts
+        finally:
+            if diarizer_model is not None:
+                del diarizer_model
+            torch.cuda.empty_cache()
+
+    def _map_speakers_with_punctuation(self, word_timestamps, speaker_ts, language, device=None):
+        wsm = self._get_words_speaker_mapping(word_timestamps, speaker_ts, "start")
+
+        if language in self._punct_model_langs:
+            # restoring punctuation in the transcript to help realign the sentences.
+            # The punctuation model also picks its device from torch.cuda.is_available().
+            with hide_cuda_from_torch(device):
+                punct_model = self._PunctuationModel(model="kredor/punctuate-all")
+
+                words_list = list(map(lambda x: x["word"], wsm))
+
+                # Process in batches to avoid chunk size errors
+                def predict_wrapper(batch, chunk_size, **kwargs):
+                    return punct_model.predict(batch, chunk_size=chunk_size)
+
+                labled_words = process_in_batches(
+                    items=words_list,
+                    process_func=predict_wrapper
+                )
+
+            ending_puncts = ".?!。！？"
+            model_puncts = ".,;:!?。！？"
+
+            # We don't want to punctuate U.S.A. with a period. Right?
+            is_acronym = lambda x: re.fullmatch(r"\b(?:[a-zA-Z]\.){2,}", x)
+
+            for word_dict, labeled_tuple in zip(wsm, labled_words):
+                word = word_dict["word"]
+                if (
+                        word
+                        and labeled_tuple[1] in ending_puncts
+                        and (word[-1] not in model_puncts or is_acronym(word))
+                ):
+                    word += labeled_tuple[1]
+                    if word.endswith(".."):
+                        word = word.rstrip(".")
+                    word_dict["word"] = word
+
+        else:
+            logging.warning(
+                f"Punctuation restoration is not available for {language} language."
+                " Using the original punctuation."
+            )
+
+        wsm = self._get_realigned_ws_mapping_with_punctuation(wsm)
+        ssm = self._get_sentences_speaker_mapping(wsm, speaker_ts)
+        return ssm
+
+    def _cancel_if_requested(self, step):
+        if self._is_cancelled:
+            logging.debug("Speaker identification worker: Cancelled %s", step)
+            return True
+        return False
+
+    def _handle_run_error(self, e):
+        logging.error(f"Speaker identification worker: Error - {e}", exc_info=True)
+        self.progress_update.emit(_("0/0 Error identifying speakers"))
+        self.error.emit(str(e))
+        self.finished.emit([])
+
+    def _cleanup(self, alignment_model):
+        import torch
+
+        logging.debug("Speaker identification worker: Cleaning up resources")
+        if alignment_model is not None:
+            try:
+                del alignment_model
+            except Exception:
+                pass
+        torch.cuda.empty_cache()
+        # Reset offline mode so it doesn't affect other operations
+        try:
+            import huggingface_hub.constants
+            huggingface_hub.constants.HF_HUB_OFFLINE = False
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            self._import_libraries()
+        except ImportError as e:
+            logging.exception("Failed to import speaker identification libraries: %s", e)
+            self.error.emit(
+                _("Speaker identification is not available: failed to load required libraries.")
+                + f"\n\n{e}"
+            )
+            return
+
+        alignment_model = None
+
+        try:
+            logging.debug("Speaker identification worker: Starting")
+            self.progress_update.emit(_("1/8 Collecting transcripts"))
+
+            if self._cancel_if_requested("at step 1"):
+                return
+
+            language, full_transcript, audio_waveform = self._get_transcript_data()
+
+            if self._cancel_if_requested("at step 2"):
+                return
+
+            self.progress_update.emit(_("2/8 Loading audio"))
+
+            device, torch_dtype = self._setup_device()
+
+            if self._cancel_if_requested("at step 3"):
+                return
+
+            self.progress_update.emit(_("3/8 Loading alignment model"))
+            alignment_model, alignment_tokenizer = self._load_alignment_model_with_retry(
+                device, torch_dtype,
+            )
+
+            if self._cancel_if_requested("at step 4"):
+                return
+
+            self.progress_update.emit(_("4/8 Processing audio"))
+            logging.debug("Speaker identification worker: Generating emissions")
+            emissions, stride = self._generate_emissions_and_cleanup(
+                alignment_model, audio_waveform, device,
+            )
+            alignment_model = None
+            logging.debug("Speaker identification worker: Emissions generated")
+
+            if self._cancel_if_requested("at step 5"):
+                return
+
+            self.progress_update.emit(_("5/8 Preparing transcripts"))
+            word_timestamps = self._get_word_timestamps(
+                full_transcript, language, emissions, stride, alignment_tokenizer,
+            )
+
+            if self._cancel_if_requested("at step 6"):
+                return
+
+            self.progress_update.emit(_("6/8 Identifying speakers"))
+            speaker_ts = self._run_diarization(audio_waveform, device)
+
+            if self._cancel_if_requested("after diarization"):
+                return
+
+            self.progress_update.emit(_("7/8 Mapping speakers to transcripts"))
+            ssm = self._map_speakers_with_punctuation(
+                word_timestamps, speaker_ts, language, device,
+            )
+
+            logging.debug("Speaker identification worker: Finished successfully")
+            self.progress_update.emit(_("8/8 Identification done"))
+            self.finished.emit(ssm)
+
+        except Exception as e:
+            self._handle_run_error(e)
+
+        finally:
+            self._cleanup(alignment_model)
+
+
+class SpeakerIdentificationWidget(QWidget):
+    resize_button_clicked = pyqtSignal()
+    identification_started = pyqtSignal()
+    identification_finished_signal = pyqtSignal()
+    active_running_instance: Optional["SpeakerIdentificationWidget"] = None
+    transcription: Transcription
+    settings = Settings()
+
+    @classmethod
+    def get_active_running_instance(cls) -> Optional["SpeakerIdentificationWidget"]:
+        """Return the actively running speaker identification dialog if still valid."""
+        instance = cls.active_running_instance
+        if instance is not None:
+            try:
+                if sip.isdeleted(instance):
+                    cls.active_running_instance = None
+                    return None
+            except Exception:
+                cls.active_running_instance = None
+                return None
+        return instance
+
+    def __init__(
+        self,
+        transcription: Transcription,
+        transcription_service: TranscriptionService,
+        parent: Optional["QWidget"] = None,
+        flags: Qt.WindowType = Qt.WindowType.Widget,
+        transcriptions_updated_signal: Optional[pyqtSignal] = None,
+    ) -> None:
+        super().__init__(parent, flags)
+        self.transcription = transcription
+        self.transcription_service = transcription_service
+        self.transcriptions_updated_signal = transcriptions_updated_signal
+        self.identification_result = None
+        self.thread = None
+        self.worker = None
+        self.needs_layout_update = False
+
+        self.setMinimumWidth(650)
+        self.setMinimumHeight(400)
+        self.setWindowTitle(file_path_as_title(transcription.file))
+
+        layout = QFormLayout(self)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+
+        self._create_step_1_group(layout)
+        self._create_step_2_group(layout)
+        self._create_save_section(layout)
+
+        self.setLayout(layout)
+        self._setup_audio_player()
+        self.destroyed.connect(self._on_destroyed)
+
+    def _create_step_1_group(self, layout: QFormLayout) -> None:
+        step_1_label = QLabel(_("Step 1: Identify speakers"), self)
+        font = step_1_label.font()
+        font.setWeight(QFont.Weight.Bold)
+        step_1_label.setFont(font)
+        layout.addRow(step_1_label)
+
+        step_1_group_box = QGroupBox(self)
+        step_1_group_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        step_1_group_box.setMinimumWidth(630)
+        step_1_layout = QVBoxLayout(step_1_group_box)
+
+        self.step_1_row = QHBoxLayout()
+
+        self.step_1_button = QPushButton(_("Identify"))
+        self.step_1_button.setMinimumWidth(200)
+        self.step_1_button.clicked.connect(self.on_identify_button_clicked)
+
+        self.cancel_button = QPushButton(_("Cancel"))
+        self.cancel_button.setMinimumWidth(200)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.clicked.connect(self.on_cancel_button_clicked)
+
+        progress_container = QVBoxLayout()
+
+        self.progress_label = QLabel(self)
+        if os.path.isfile(self.transcription.file):
+            self.progress_label.setText(_("Ready to identify speakers"))
+        else:
+            self.progress_label.setText(_("Audio file not found"))
+            self.step_1_button.setEnabled(False)
+
+        # Model selection, shown in place of the progress bar before identification starts
+        self.model_selection_widget = QWidget(self)
+        model_selection_layout = QHBoxLayout(self.model_selection_widget)
+        model_selection_layout.setContentsMargins(0, 0, 0, 0)
+        model_selection_layout.addWidget(QLabel(_("Model:"), self))
+
+        self.diarizer_button_group = QButtonGroup(self)
+        self.msdd_radio = QRadioButton(_("MSDD"), self)
+        self.msdd_radio.setChecked(True)
+        self.sortformer_radio = QRadioButton(_("Sortformer"), self)
+        self.diarizer_button_group.addButton(self.msdd_radio)
+        self.diarizer_button_group.addButton(self.sortformer_radio)
+        model_selection_layout.addWidget(self.msdd_radio)
+        model_selection_layout.addWidget(self.sortformer_radio)
+        model_selection_layout.addSpacing(12)
+        model_selection_layout.addWidget(QLabel(_("Speakers:"), self))
+
+        self.speaker_count_combo = QComboBox(self)
+        self.speaker_count_combo.addItem(_("Auto"), None)
+        for speaker_count in range(2, 9):
+            self.speaker_count_combo.addItem(str(speaker_count), speaker_count)
+        self.speaker_count_combo.setToolTip(
+            _("Set the known number of speakers, or use Auto to detect it.")
+        )
+        model_selection_layout.addWidget(self.speaker_count_combo)
+        self.sortformer_radio.toggled.connect(self._on_diarizer_changed)
+        model_selection_layout.addStretch()
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setMinimumWidth(400)
+        self.progress_bar.setRange(0, 8)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+
+        progress_container.addWidget(self.progress_label)
+        progress_container.addWidget(self.model_selection_widget)
+        progress_container.addWidget(self.progress_bar)
+
+        self.step_1_row.addLayout(progress_container)
+
+        button_container = QVBoxLayout()
+        button_container.addWidget(self.step_1_button)
+        button_container.addWidget(self.cancel_button)
+        self.step_1_row.addLayout(button_container)
+
+        step_1_layout.addLayout(self.step_1_row)
+
+        layout.addRow(step_1_group_box)
+
+        spacer = QSpacerItem(0, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        layout.addItem(spacer)
+
+    def _create_step_2_group(self, layout: QFormLayout) -> None:
+        step_2_label = QLabel(_("Step 2: Name speakers"), self)
+        font = step_2_label.font()
+        font.setWeight(QFont.Weight.Bold)
+        step_2_label.setFont(font)
+        layout.addRow(step_2_label)
+
+        self.step_2_group_box = QGroupBox(self)
+        self.step_2_group_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.step_2_group_box.setEnabled(False)
+        step_2_layout = QVBoxLayout(self.step_2_group_box)
+
+        self.speaker_preview_row = QVBoxLayout()
+
+        self.speaker_0_input = LineEdit("Speaker 0", self)
+
+        self.speaker_0_preview_button = QPushButton(_("Play sample"))
+        self.speaker_0_preview_button.setMinimumWidth(200)
+        self.speaker_0_preview_button.clicked.connect(lambda: self.on_speaker_preview("Speaker 0"))
+
+        speaker_0_layout = QHBoxLayout()
+        speaker_0_layout.addWidget(self.speaker_0_input)
+        speaker_0_layout.addWidget(self.speaker_0_preview_button)
+
+        self.speaker_preview_row.addLayout(speaker_0_layout)
+
+        step_2_layout.addLayout(self.speaker_preview_row)
+
+        layout.addRow(self.step_2_group_box)
+
+    def _create_save_section(self, layout: QFormLayout) -> None:
+        self.merge_speaker_sentences = QCheckBox(_("Merge speaker sentences"))
+        self.merge_speaker_sentences.setChecked(True)
+        self.merge_speaker_sentences.setEnabled(False)
+        self.merge_speaker_sentences.setMinimumWidth(250)
+
+        self.save_button = QPushButton(_("Save"))
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self.on_save_button_clicked)
+
+        layout.addRow(self.merge_speaker_sentences)
+        layout.addRow(self.save_button)
+
+    def _setup_audio_player(self) -> None:
+        # Created on first playback: decoding the file takes a moment and the
+        # dialog is often closed without any sample being played.
+        self.player: Optional[AudioFilePlayer] = None
+        self.player_timer = None
+
+    def _get_audio_player(self) -> Optional["AudioFilePlayer"]:
+        """Returns the sample player, creating it on first use, or None if the file cannot be played."""
+        if self.player is not None:
+            return self.player
+
+        if not os.path.isfile(self.transcription.file):
+            logging.warning(
+                "Speaker identification: cannot play sample, file not found %s",
+                self.transcription.file,
+            )
+            return None
+
+        player = AudioFilePlayer(self.transcription.file)
+        if not player.ready:
+            player.close()
+            logging.error(
+                "Speaker identification: could not open %s for playback",
+                self.transcription.file,
+            )
+            return None
+
+        self.player = player
+        return self.player
+
+    def on_identify_button_clicked(self):
+        self.step_1_button.setEnabled(False)
+        self.step_1_button.setVisible(False)
+        self.cancel_button.setVisible(True)
+
+        # Swap the model selector for the progress bar while identification runs
+        self.model_selection_widget.setVisible(False)
+        self.progress_bar.setVisible(True)
+
+        diarizer = "sortformer" if self.sortformer_radio.isChecked() else "msdd"
+        num_speakers = (
+            self.speaker_count_combo.currentData() if diarizer == "msdd" else None
+        )
+
+        # Clean up any existing thread before starting a new one
+        self._cleanup_thread()
+
+        SpeakerIdentificationWidget.active_running_instance = self
+        self.identification_started.emit()
+
+        logging.debug("Speaker identification: Starting identification thread (%s)", diarizer)
+
+        self.thread = QThread()
+        self.worker = IdentificationWorker(
+            self.transcription,
+            self.transcription_service,
+            diarizer=diarizer,
+            num_speakers=num_speakers,
+        )
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self._on_thread_finished)
+        self.worker.progress_update.connect(self.on_progress_update)
+        self.worker.error.connect(self.on_identification_error)
+
+        self.thread.start()
+
+    def _on_diarizer_changed(self, sortformer_selected: bool) -> None:
+        """Enable the exact speaker count only for models that support it."""
+        self.speaker_count_combo.setEnabled(not sortformer_selected)
+        if sortformer_selected:
+            self.speaker_count_combo.setCurrentIndex(0)
+
+    def on_cancel_button_clicked(self):
+        """Handle cancel button click."""
+        logging.debug("Speaker identification: Cancel requested by user")
+        self.cancel_button.setEnabled(False)
+        self.progress_label.setText(_("Cancelling..."))
+        self._cleanup_thread()
+        self._reset_buttons()
+        self.progress_label.setText(_("Cancelled"))
+        self.progress_bar.setValue(0)
+        self._show_model_selector()
+
+    def _reset_buttons(self):
+        """Reset identify/cancel buttons to initial state."""
+        self.step_1_button.setVisible(True)
+        self.step_1_button.setEnabled(True)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.setEnabled(True)
+
+    def _on_thread_finished(self, result):
+        """Handle thread completion and cleanup."""
+        logging.debug("Speaker identification: Thread finished")
+        if self.thread is not None:
+            self.thread.quit()
+            self.thread.wait(5000)
+        self._reset_buttons()
+        self.on_identification_finished(result)
+
+    def on_identification_error(self, error_message):
+        """Handle identification error."""
+        logging.error(f"Speaker identification error: {error_message}")
+        self._reset_buttons()
+        self.progress_bar.setValue(0)
+        self._show_model_selector()
+
+    def _show_model_selector(self):
+        """Restore the model selector in place of the progress bar."""
+        self.progress_bar.setVisible(False)
+        self.model_selection_widget.setVisible(True)
+
+    def on_progress_update(self, progress):
+        self.progress_label.setText(progress)
+
+        progress_value = 0
+        if progress and progress[0].isdigit():
+            progress_value = int(progress[0])
+            self.progress_bar.setValue(progress_value)
+        else:
+            logging.error(f"Invalid progress format: {progress}")
+
+        if progress_value == 8:
+            self.step_2_group_box.setEnabled(True)
+            self.merge_speaker_sentences.setEnabled(True)
+            self.save_button.setEnabled(True)
+
+    def on_identification_finished(self, result):
+        self.identification_result = result
+
+        # Handle empty results (error case)
+        if not result:
+            logging.debug("Speaker identification: Empty result received")
+            return
+
+        unique_speakers = {entry['speaker'] for entry in result}
+
+        while self.speaker_preview_row.count():
+            item = self.speaker_preview_row.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            else:
+                layout = item.layout()
+                if layout:
+                    while layout.count():
+                        sub_item = layout.takeAt(0)
+                        sub_widget = sub_item.widget()
+                        if sub_widget:
+                            sub_widget.deleteLater()
+
+        for speaker in sorted(unique_speakers):
+            speaker_input = LineEdit(speaker, self)
+            speaker_input.setMinimumWidth(200)
+
+            speaker_preview_button = QPushButton(_("Play sample"))
+            speaker_preview_button.setMinimumWidth(200)
+            speaker_preview_button.clicked.connect(lambda checked, s=speaker: self.on_speaker_preview(s))
+
+            speaker_layout = QHBoxLayout()
+            speaker_layout.addWidget(speaker_input)
+            speaker_layout.addWidget(speaker_preview_button)
+
+            self.speaker_preview_row.addLayout(speaker_layout)
+
+        # Trigger layout update to properly size the new widgets
+        self.layout().activate()
+        self.adjustSize()
+        # Schedule update if window is minimized
+        self.needs_layout_update = True
+
+    def on_speaker_preview(self, speaker_id):
+        self._stop_playback()
+
+        speaker_records = [record for record in self.identification_result if record['speaker'] == speaker_id]
+
+        if not speaker_records:
+            return
+
+        player = self._get_audio_player()
+        if player is None:
+            return
+
+        random_record = random.choice(speaker_records)
+
+        start_time = int(random_record['start_time'])
+        end_time = int(random_record['end_time'])
+        # Stop at the end of the sampled segment, capped so a long monologue
+        # does not keep playing after the button was clicked.
+        duration = min(max(end_time - start_time, 0), MAX_PREVIEW_DURATION_MS)
+        if duration <= 0:
+            return
+
+        player.seek(start_time)
+        player.play()
+
+        self.player_timer = QTimer(self)
+        self.player_timer.setSingleShot(True)
+        self.player_timer.timeout.connect(self._stop_playback)
+        self.player_timer.start(duration)
+
+    def _stop_playback(self) -> None:
+        if self.player_timer:
+            self.player_timer.stop()
+        if self.player is not None:
+            self.player.stop()
+
+    def on_save_button_clicked(self):
+        speaker_names = []
+        for i in range(self.speaker_preview_row.count()):
+            item = self.speaker_preview_row.itemAt(i)
+            if item.layout():
+                for j in range(item.layout().count()):
+                    sub_item = item.layout().itemAt(j)
+                    widget = sub_item.widget()
+                    if isinstance(widget, LineEdit):
+                        speaker_names.append(widget.text())
+
+        unique_speakers = {entry['speaker'] for entry in self.identification_result}
+        original_speakers = sorted(unique_speakers)
+        speaker_mapping = dict(zip(original_speakers, speaker_names))
+
+        segments = build_speaker_segments(
+            self.identification_result,
+            speaker_mapping=speaker_mapping,
+            merge_speaker_sentences=self.merge_speaker_sentences.isChecked(),
+        )
+
+        new_transcript_id = self.transcription_service.copy_transcription(
+            self.transcription.id_as_uuid
+        )
+
+        self.transcription_service.update_transcription_as_completed(new_transcript_id, segments)
+
+        # TODO - See if we can get rows in the transcription viewer to be of variable height
+        #        If text is longer they should expand
+        if self.transcriptions_updated_signal:
+            self.transcriptions_updated_signal.emit(new_transcript_id)
+
+        self._stop_playback()
+
+        self.close()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+
+        # Handle window activation (restored from minimized or brought to front)
+        if self.needs_layout_update:
+            self.layout().activate()
+            self.adjustSize()
+            self.needs_layout_update = False
+
+    def _on_destroyed(self):
+        """Ensure active_running_instance is cleared if widget is destroyed."""
+        if SpeakerIdentificationWidget.active_running_instance is self:
+            SpeakerIdentificationWidget.active_running_instance = None
+            try:
+                self.identification_finished_signal.emit()
+            except Exception:
+                pass
+
+    def closeEvent(self, event):
+        self.hide()
+
+        # Stop playback and release the decoded audio
+        self._stop_playback()
+        if self.player is not None:
+            self.player.close()
+            self.player = None
+
+        # Clean up thread if running
+        self._cleanup_thread()
+
+        super().closeEvent(event)
+
+    def _cleanup_thread(self):
+        """Properly clean up the worker thread."""
+        if SpeakerIdentificationWidget.active_running_instance is self:
+            SpeakerIdentificationWidget.active_running_instance = None
+            self.identification_finished_signal.emit()
+
+        if self.worker is not None:
+            # Request cancellation first
+            self.worker.cancel()
+
+        if self.thread is not None and self.thread.isRunning():
+            logging.debug("Speaker identification: Stopping running thread")
+            self.thread.quit()
+            if not self.thread.wait(10000):  # Wait up to 10 seconds
+                logging.warning("Speaker identification: Thread did not quit, terminating")
+                self.thread.terminate()
+                if not self.thread.wait(2000):
+                    logging.error("Speaker identification: Thread failed to terminate")
+
+        self.thread = None
+        self.worker = None

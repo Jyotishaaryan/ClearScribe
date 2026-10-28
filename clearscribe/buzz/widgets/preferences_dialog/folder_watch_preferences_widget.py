@@ -1,0 +1,335 @@
+import os
+from typing import Tuple, Optional
+
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import (
+    QWidget,
+    QPushButton,
+    QFormLayout,
+    QHBoxLayout,
+    QFileDialog,
+    QCheckBox,
+    QVBoxLayout,
+    QMessageBox,
+    QComboBox,
+    QGroupBox,
+    QLabel,
+)
+
+from buzz.locale import _
+from buzz.store.keyring_store import Key, get_password
+from buzz.transcriber.transcriber import (
+    TranscriptionOptions,
+    FileTranscriptionOptions,
+)
+from buzz.widgets.line_edit import LineEdit
+from buzz.widgets.preferences_dialog.models.file_transcription_preferences import (
+    FileTranscriptionPreferences,
+)
+from buzz.widgets.preferences_dialog.models.folder_watch_preferences import (
+    FolderWatchPreferences,
+)
+from buzz.widgets.transcriber.file_transcription_form_widget import (
+    FileTranscriptionFormWidget,
+)
+
+
+class FolderWatchPreferencesWidget(QWidget):
+    config_changed = pyqtSignal(FolderWatchPreferences)
+
+    def __init__(
+        self, config: FolderWatchPreferences, parent: Optional[QWidget] = None
+    ):
+        super().__init__(parent)
+
+        self.config = config
+
+        checkbox = QCheckBox(_("Enable folder watch"))
+        checkbox.setChecked(config.enabled)
+        checkbox.setObjectName("EnableFolderWatchCheckbox")
+        checkbox.stateChanged.connect(self.on_enable_changed)
+
+        delete_checkbox = QCheckBox(_("Delete processed files"))
+        delete_checkbox.setChecked(config.delete_processed_files)
+        delete_checkbox.setObjectName("DeleteProcessedFilesCheckbox")
+        delete_checkbox.setToolTip(
+            _("Note: Audio playback will not be available")
+        )
+        delete_checkbox.stateChanged.connect(self.on_delete_processed_files_changed)
+
+        self.input_folder_browse_button = QPushButton(_("Browse"))
+        self.input_folder_browse_button.clicked.connect(self.on_click_browse_input_folder)
+
+        self.output_folder_browse_button = QPushButton(_("Browse"))
+        self.output_folder_browse_button.clicked.connect(self.on_click_browse_output_folder)
+
+        input_folder_row = QHBoxLayout()
+        self.input_folder_line_edit = LineEdit(config.input_directory, self)
+        self.input_folder_line_edit.setPlaceholderText("/path/to/input/folder")
+        self.input_folder_line_edit.textChanged.connect(self.on_input_folder_changed)
+        self.input_folder_line_edit.setObjectName("InputFolderLineEdit")
+
+        input_folder_row.addWidget(self.input_folder_line_edit)
+        input_folder_row.addWidget(self.input_folder_browse_button)
+
+        output_folder_row = QHBoxLayout()
+        self.output_folder_line_edit = LineEdit(config.output_directory, self)
+        self.output_folder_line_edit.setPlaceholderText("/path/to/output/folder")
+        self.output_folder_line_edit.textChanged.connect(self.on_output_folder_changed)
+        self.output_folder_line_edit.editingFinished.connect(
+            self.on_output_folder_editing_finished
+        )
+        self.output_folder_line_edit.setObjectName("OutputFolderLineEdit")
+
+        output_folder_row.addWidget(self.output_folder_line_edit)
+        output_folder_row.addWidget(self.output_folder_browse_button)
+
+        openai_access_token = get_password(Key.OPENAI_API_KEY)
+        (
+            transcription_options,
+            file_transcription_options,
+        ) = config.file_transcription_options.to_transcription_options(
+            openai_access_token=openai_access_token,
+            file_paths=[],
+        )
+
+        self.transcription_form_widget = FileTranscriptionFormWidget(
+            transcription_options=transcription_options,
+            file_transcription_options=file_transcription_options,
+            parent=self,
+        )
+        self.transcription_form_widget.transcription_options_changed.connect(
+            self.on_transcription_options_changed
+        )
+
+        self.delete_checkbox = delete_checkbox
+
+        (
+            self.speaker_identification_label,
+            self.speaker_identification_group_box,
+        ) = self._create_speaker_identification_group()
+
+        layout = QVBoxLayout(self)
+
+        folders_form_layout = QFormLayout()
+
+        folders_form_layout.addRow("", checkbox)
+        folders_form_layout.addRow(_("Input folder"), input_folder_row)
+        folders_form_layout.addRow(_("Output folder"), output_folder_row)
+        folders_form_layout.addRow("", delete_checkbox)
+        folders_form_layout.addWidget(self.transcription_form_widget)
+
+        layout.addLayout(folders_form_layout)
+        layout.addWidget(self.transcription_form_widget)
+        layout.addWidget(self.speaker_identification_label)
+        layout.addWidget(self.speaker_identification_group_box)
+        layout.addStretch()
+
+        self.setLayout(layout)
+
+        self._set_settings_enabled(config.enabled)
+
+    def _create_speaker_identification_group(self) -> Tuple[QLabel, QGroupBox]:
+        title_label = QLabel(_("Speaker identification"), self)
+        title_label.setObjectName("SpeakerIdentificationLabel")
+        font = title_label.font()
+        font.setWeight(QFont.Weight.Bold)
+        title_label.setFont(font)
+
+        group_box = QGroupBox(self)
+        group_box.setObjectName("SpeakerIdentificationGroupBox")
+
+        self.identify_speakers_checkbox = QCheckBox(_("Identify speakers"))
+        self.identify_speakers_checkbox.setChecked(self.config.identify_speakers)
+        self.identify_speakers_checkbox.setObjectName("IdentifySpeakersCheckbox")
+        self.identify_speakers_checkbox.setToolTip(
+            _(
+                "Identify speakers after transcription and add speaker labels "
+                "to the exported transcripts. Transcription will take longer."
+            )
+        )
+        self.identify_speakers_checkbox.stateChanged.connect(
+            self.on_identify_speakers_changed
+        )
+
+        self.diarizer_combo_box = QComboBox(self)
+        self.diarizer_combo_box.setObjectName("SpeakerDiarizerComboBox")
+        self.diarizer_combo_box.addItem(_("MSDD"), "msdd")
+        self.diarizer_combo_box.addItem(_("Sortformer"), "sortformer")
+        diarizer_index = self.diarizer_combo_box.findData(self.config.speaker_diarizer)
+        self.diarizer_combo_box.setCurrentIndex(max(diarizer_index, 0))
+        self.diarizer_combo_box.currentIndexChanged.connect(
+            self.on_speaker_diarizer_changed
+        )
+
+        self.speaker_count_combo_box = QComboBox(self)
+        self.speaker_count_combo_box.setObjectName("SpeakerCountComboBox")
+        self.speaker_count_combo_box.addItem(_("Auto"), None)
+        for speaker_count in range(2, 9):
+            self.speaker_count_combo_box.addItem(str(speaker_count), speaker_count)
+        speaker_count_index = self.speaker_count_combo_box.findData(
+            self.config.speaker_count
+        )
+        self.speaker_count_combo_box.setCurrentIndex(max(speaker_count_index, 0))
+        self.speaker_count_combo_box.setToolTip(
+            _("Set the known number of speakers, or use Auto to detect it.")
+        )
+        self.speaker_count_combo_box.currentIndexChanged.connect(
+            self.on_speaker_count_changed
+        )
+
+        self.merge_speaker_sentences_checkbox = QCheckBox(
+            _("Merge speaker sentences")
+        )
+        self.merge_speaker_sentences_checkbox.setChecked(
+            self.config.merge_speaker_sentences
+        )
+        self.merge_speaker_sentences_checkbox.setObjectName(
+            "MergeSpeakerSentencesCheckbox"
+        )
+        self.merge_speaker_sentences_checkbox.stateChanged.connect(
+            self.on_merge_speaker_sentences_changed
+        )
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.diarizer_combo_box)
+        model_row.addSpacing(12)
+        model_row.addWidget(QLabel(_("Speakers:"), self))
+        model_row.addWidget(self.speaker_count_combo_box)
+        model_row.addStretch()
+
+        form_layout = QFormLayout(group_box)
+        form_layout.addRow("", self.identify_speakers_checkbox)
+        form_layout.addRow(_("Model"), model_row)
+        form_layout.addRow("", self.merge_speaker_sentences_checkbox)
+
+        self._set_speaker_options_enabled(
+            self.config.enabled and self.config.identify_speakers
+        )
+
+        return title_label, group_box
+
+    def _set_speaker_options_enabled(self, enabled: bool):
+        self.diarizer_combo_box.setEnabled(enabled)
+        self.speaker_count_combo_box.setEnabled(
+            enabled and self.config.speaker_diarizer == "msdd"
+        )
+        self.merge_speaker_sentences_checkbox.setEnabled(enabled)
+
+    def on_identify_speakers_changed(self, state: int):
+        self.config.identify_speakers = state == 2
+        self._set_speaker_options_enabled(
+            self.config.enabled and self.config.identify_speakers
+        )
+        self.config_changed.emit(self.config)
+
+    def on_speaker_diarizer_changed(self, _index: int):
+        self.config.speaker_diarizer = self.diarizer_combo_box.currentData()
+        self._set_speaker_options_enabled(
+            self.config.enabled and self.config.identify_speakers
+        )
+        self.config_changed.emit(self.config)
+
+    def on_speaker_count_changed(self, _index: int):
+        self.config.speaker_count = self.speaker_count_combo_box.currentData()
+        self.config_changed.emit(self.config)
+
+    def on_merge_speaker_sentences_changed(self, state: int):
+        self.config.merge_speaker_sentences = state == 2
+        self.config_changed.emit(self.config)
+
+    def on_click_browse_input_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, _("Select Input Folder"))
+        self.input_folder_line_edit.setText(folder)
+        self.on_input_folder_changed(folder)
+
+    def on_input_folder_changed(self, folder):
+        self.config.input_directory = folder
+        self.config_changed.emit(self.config)
+
+    def on_click_browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, _("Select Output Folder"))
+        if not folder:
+            return
+        if self._is_subfolder_of_input(folder):
+            self._show_output_subfolder_error()
+            self.output_folder_line_edit.setText("")
+            self.on_output_folder_changed("")
+            return
+        self.output_folder_line_edit.setText(folder)
+        self.on_output_folder_changed(folder)
+
+    def on_output_folder_changed(self, folder):
+        # Don't persist an invalid output folder, but stay silent while the
+        # user is still typing. The warning is shown on editingFinished.
+        if self._is_subfolder_of_input(folder):
+            return
+        self.config.output_directory = folder
+        self.config_changed.emit(self.config)
+
+    def on_output_folder_editing_finished(self):
+        folder = self.output_folder_line_edit.text()
+        if self._is_subfolder_of_input(folder):
+            self._show_output_subfolder_error()
+            self.output_folder_line_edit.setText("")
+            self.on_output_folder_changed("")
+
+    def _is_subfolder_of_input(self, output_folder: str) -> bool:
+        input_folder = self.config.input_directory
+        if not input_folder or not output_folder:
+            return False
+
+        input_path = os.path.realpath(input_folder)
+        output_path = os.path.realpath(output_folder)
+
+        try:
+            common = os.path.commonpath([input_path, output_path])
+        except ValueError:
+            # Paths on different drives cannot be compared
+            return False
+
+        return common == input_path
+
+    def _show_output_subfolder_error(self):
+        QMessageBox.warning(
+            self,
+            _("Error"),
+            _(
+                "The output folder cannot be the input folder or a subfolder of it. "
+                "This would cause transcriptions to be processed repeatedly. "
+                "Please choose a different output folder."
+            ),
+        )
+
+    def _set_settings_enabled(self, enabled: bool):
+        self.input_folder_line_edit.setEnabled(enabled)
+        self.input_folder_browse_button.setEnabled(enabled)
+        self.output_folder_line_edit.setEnabled(enabled)
+        self.output_folder_browse_button.setEnabled(enabled)
+        self.delete_checkbox.setEnabled(enabled)
+        self.transcription_form_widget.setEnabled(enabled)
+        self.identify_speakers_checkbox.setEnabled(enabled)
+        self._set_speaker_options_enabled(enabled and self.config.identify_speakers)
+
+    def on_enable_changed(self, state: int):
+        enabled = state == 2
+        self.config.enabled = enabled
+        self._set_settings_enabled(enabled)
+        self.config_changed.emit(self.config)
+
+    def on_delete_processed_files_changed(self, state: int):
+        self.config.delete_processed_files = state == 2
+        self.config_changed.emit(self.config)
+
+    def on_transcription_options_changed(
+        self, options: Tuple[TranscriptionOptions, FileTranscriptionOptions]
+    ):
+        transcription_options, file_transcription_options = options
+        self.config.file_transcription_options = (
+            FileTranscriptionPreferences.from_transcription_options(
+                transcription_options=transcription_options,
+                file_transcription_options=file_transcription_options,
+            )
+        )
+        self.config_changed.emit(self.config)

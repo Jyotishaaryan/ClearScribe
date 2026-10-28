@@ -1,0 +1,1353 @@
+import uuid
+import sys
+import pytest
+from pytestqt.qtbot import QtBot
+from PyQt6.QtCore import Qt
+from PyQt6.QtMultimedia import QMediaPlayer
+from unittest.mock import MagicMock, patch
+
+from buzz.locale import _
+from buzz.db.entity.transcription import Transcription
+from buzz.db.entity.transcription_segment import TranscriptionSegment
+from buzz.model_loader import ModelType, WhisperModelSize
+from buzz.transcriber.transcriber import Task
+from buzz.widgets.transcription_viewer.transcription_viewer_widget import (
+    TranscriptionViewerWidget,
+)
+from buzz.widgets.transcription_viewer.transcription_view_mode_tool_button import ViewMode
+from tests.audio import test_audio_path
+
+
+class TestTranscriptionViewerWidgetAdditional:
+    """Additional tests for TranscriptionViewerWidget functions"""
+
+    @pytest.fixture()
+    def transcription(self, transcription_dao, transcription_segment_dao) -> Transcription:
+        """Create test transcription with multiple segments"""
+        id = uuid.uuid4()
+        transcription_dao.insert(
+            Transcription(
+                id=str(id),
+                status="completed",
+                file=test_audio_path,
+                task=Task.TRANSCRIBE.value,
+                model_type=ModelType.WHISPER.value,
+                whisper_model_size=WhisperModelSize.TINY.value,
+            )
+        )
+        transcription_segment_dao.insert(
+            TranscriptionSegment(40, 500, "First segment", "", str(id))
+        )
+        transcription_segment_dao.insert(
+            TranscriptionSegment(500, 1000, "Second segment", "", str(id))
+        )
+        transcription_segment_dao.insert(
+            TranscriptionSegment(1000, 1500, "Third segment", "", str(id))
+        )
+
+        return transcription_dao.find_by_id(str(id))
+
+    def test_minimum_width_fits_visible_controls(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Narrowing the window must not crop the playback controls row"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget.show()
+
+        widget.loop_controls_frame.show()
+        qtbot.waitUntil(
+            lambda: widget.minimumWidth() >= widget.loop_controls_frame.minimumSizeHint().width()
+        )
+        widget.resize(widget.MINIMUM_WIDTH, widget.height())
+        qtbot.waitUntil(
+            lambda: widget.loop_controls_frame.width() >= widget.loop_controls_frame.minimumSizeHint().width()
+        )
+
+        widget.loop_controls_frame.hide()
+        qtbot.waitUntil(lambda: widget.minimumWidth() == widget.MINIMUM_WIDTH)
+
+        widget.close()
+
+    def test_toggle_audio_playback(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test toggle_audio_playback method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Test toggle when stopped
+        initial_state = widget.audio_player.media_player.playbackState()
+        widget.toggle_audio_playback()
+
+        # Should not crash
+        assert hasattr(widget, 'toggle_audio_playback')
+
+        widget.close()
+
+    def test_replay_current_segment(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test replay_current_segment method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Without selected segment, should do nothing
+        widget.replay_current_segment()
+
+        # With selected segment
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+        widget.replay_current_segment()
+
+        # Should not crash
+        assert hasattr(widget, 'replay_current_segment')
+
+        widget.close()
+
+    def test_decrease_segment_start(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test decrease_segment_start method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Without selected segment
+        widget.decrease_segment_start()
+
+        # With selected segment
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+        initial_start = widget.currently_selected_segment.value("start_time")
+
+        widget.decrease_segment_start()
+
+        # Should not crash
+        assert hasattr(widget, 'decrease_segment_start')
+
+        widget.close()
+
+    def test_increase_segment_start(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test increase_segment_start method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Without selected segment
+        widget.increase_segment_start()
+
+        # With selected segment
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+        widget.increase_segment_start()
+
+        # Should not crash
+        assert hasattr(widget, 'increase_segment_start')
+
+        widget.close()
+
+    def test_decrease_segment_end(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test decrease_segment_end method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Without selected segment
+        widget.decrease_segment_end()
+
+        # With selected segment
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+        widget.decrease_segment_end()
+
+        # Should not crash
+        assert hasattr(widget, 'decrease_segment_end')
+
+        widget.close()
+
+    def test_increase_segment_end(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test increase_segment_end method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Without selected segment
+        widget.increase_segment_end()
+
+        # With selected segment
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+        widget.increase_segment_end()
+
+        # Should not crash
+        assert hasattr(widget, 'increase_segment_end')
+
+        widget.close()
+
+    def test_adjust_segment_timestamp_start(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test _adjust_segment_timestamp for start time"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Select first segment
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+
+        # Adjust start time
+        widget._adjust_segment_timestamp("start_time", 100)
+
+        # Should not crash
+        assert hasattr(widget, '_adjust_segment_timestamp')
+
+        widget.close()
+
+    def test_adjust_segment_timestamp_end(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test _adjust_segment_timestamp for end time"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Select first segment
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+
+        # Adjust end time
+        widget._adjust_segment_timestamp("end_time", 100)
+
+        # Should not crash
+        assert hasattr(widget, '_adjust_segment_timestamp')
+
+        widget.close()
+
+    def test_adjust_segment_timestamp_overlap_prevention(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test that _adjust_segment_timestamp prevents overlaps"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Select second segment (has previous and next segments)
+        widget.currently_selected_segment = widget.table_widget.model().record(1)
+
+        # Try to adjust start time to overlap with previous segment
+        widget._adjust_segment_timestamp("start_time", -600)
+
+        # Should not crash and should handle overlap
+        assert hasattr(widget, '_adjust_segment_timestamp')
+
+        widget.close()
+
+    def test_on_audio_playback_state_changed(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_audio_playback_state_changed method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Test with playing state
+        widget.on_audio_playback_state_changed(QMediaPlayer.PlaybackState.PlayingState)
+
+        # Test with stopped state
+        widget.on_audio_playback_state_changed(QMediaPlayer.PlaybackState.StoppedState)
+
+        # Should not crash
+        assert hasattr(widget, 'on_audio_playback_state_changed')
+
+        widget.close()
+
+    def test_initialize_speed_control(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test initialize_speed_control method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.initialize_speed_control()
+
+        # Should set speed combo text
+        assert len(widget.speed_combo.currentText()) > 0
+        assert "x" in widget.speed_combo.currentText()
+
+        widget.close()
+
+    def test_on_speed_changed_valid(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_speed_changed with valid speed"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.on_speed_changed("1.5x")
+
+        # Should update audio player speed
+        assert widget.audio_player.media_player.playbackRate() == 1.5
+
+        widget.close()
+
+    def test_on_speed_changed_invalid(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_speed_changed with invalid speed"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Should not crash with invalid input
+        widget.on_speed_changed("invalid")
+
+        widget.close()
+
+    def test_on_speed_changed_clamping(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_speed_changed clamps values to valid range"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Too low
+        widget.on_speed_changed("0.05x")
+        assert widget.audio_player.media_player.playbackRate() >= 0.1
+
+        # Too high
+        widget.on_speed_changed("10x")
+        assert widget.audio_player.media_player.playbackRate() <= 5.0
+
+        widget.close()
+
+    def test_increase_speed(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test increase_speed method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Set speed to a known value below maximum to ensure we can increase
+        widget.set_speed(1.0)
+        initial_speed = widget.get_current_speed()
+        widget.increase_speed()
+        new_speed = widget.get_current_speed()
+
+        assert new_speed > initial_speed
+
+        widget.close()
+
+    def test_decrease_speed(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test decrease_speed method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Set speed to a known value above minimum to ensure we can decrease
+        widget.set_speed(1.0)
+        initial_speed = widget.get_current_speed()
+        widget.decrease_speed()
+        new_speed = widget.get_current_speed()
+
+        assert new_speed < initial_speed
+
+        widget.close()
+
+    def test_get_current_speed(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test get_current_speed method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        speed = widget.get_current_speed()
+        assert isinstance(speed, float)
+        assert speed > 0
+
+        widget.close()
+
+    def test_set_speed(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test set_speed method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.set_speed(1.5)
+        assert widget.get_current_speed() == 1.5
+
+        widget.close()
+
+    def test_perform_search(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test perform_search method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.search_text = "segment"
+        widget.perform_search()
+
+        # Should find matches
+        assert len(widget.search_results) > 0
+
+        widget.close()
+
+    def test_search_in_table(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test search_in_table method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.search_text = "First"
+        widget.search_in_table()
+
+        # Should find match in first segment
+        assert len(widget.search_results) > 0
+
+        widget.close()
+
+    def test_search_in_text(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test search_in_text method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.view_mode = ViewMode.TEXT
+        widget.reset_view()
+
+        widget.search_text = "segment"
+        widget.search_in_text()
+
+        # Should find matches
+        assert len(widget.search_results) >= 0
+
+        widget.close()
+
+    def test_update_search_ui_with_results(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test update_search_ui with search results"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.search_results = [("table", 0, None), ("table", 1, None)]
+        widget.update_search_ui()
+
+        # Should enable buttons
+        assert widget.search_prev_button.isEnabled()
+        assert widget.search_next_button.isEnabled()
+        assert len(widget.search_results_label.text()) > 0
+
+        widget.close()
+
+    def test_update_search_ui_no_results(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test update_search_ui with no search results"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.search_results = []
+        widget.update_search_ui()
+
+        # Should disable buttons
+        assert not widget.search_prev_button.isEnabled()
+        assert not widget.search_next_button.isEnabled()
+        assert _("No matches found") in widget.search_results_label.text()
+
+        widget.close()
+
+    def test_highlight_current_match_table(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test highlight_current_match for table view"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.search_results = [("table", 0, None)]
+        widget.current_search_index = 0
+        widget.highlight_current_match()
+
+        # Should not crash
+        assert hasattr(widget, 'highlight_current_match')
+
+        widget.close()
+
+    def test_highlight_table_match(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test highlight_table_match method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.highlight_table_match(0)
+
+        # Should select the row
+        assert hasattr(widget, 'highlight_table_match')
+
+        widget.close()
+
+    def test_highlight_text_match(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test highlight_text_match method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.view_mode = ViewMode.TEXT
+        widget.reset_view()
+
+        widget.search_text = "test"
+        widget.highlight_text_match(0)
+
+        # Should not crash
+        assert hasattr(widget, 'highlight_text_match')
+
+        widget.close()
+
+    def test_update_search_results_label(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test update_search_results_label method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.search_results = [("table", 0, None), ("table", 1, None)]
+        widget.current_search_index = 0
+        widget.update_search_results_label()
+
+        # Should show "1 of 2"
+        label_text = widget.search_results_label.text()
+        assert "1" in label_text
+        assert "2" in label_text
+
+        widget.close()
+
+    def test_show_search_bar(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test show_search_bar method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.show_search_bar()
+
+        # Should show search frame and focus input
+        assert hasattr(widget, 'show_search_bar')
+
+        widget.close()
+
+    def test_toggle_search_bar_visibility(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test toggle_search_bar_visibility method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Test that the method exists and can be called
+        widget.toggle_search_bar_visibility()
+
+        # Should toggle visibility
+        assert hasattr(widget, 'toggle_search_bar_visibility')
+
+        widget.close()
+
+    def test_event_filter(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test eventFilter method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtGui import QKeyEvent
+
+        # Test Shift+Enter in search input
+        event = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Return,
+            Qt.KeyboardModifier.ShiftModifier
+        )
+        result = widget.eventFilter(widget.search_input, event)
+
+        # Should handle the event
+        assert isinstance(result, bool)
+
+        widget.close()
+
+    def test_reset_view_timestamps(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test reset_view with TIMESTAMPS mode"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget.show()  # Show the widget so visibility checks work
+
+        widget.view_mode = ViewMode.TIMESTAMPS
+        widget.reset_view()
+
+        # Should show table, hide text display
+        assert widget.table_widget.isVisible()
+        assert not widget.text_display_box.isVisible()
+
+        widget.close()
+
+    def test_reset_view_text(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test reset_view with TEXT mode"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget.show()  # Show the widget so visibility checks work
+
+        widget.view_mode = ViewMode.TEXT
+        widget.reset_view()
+
+        # Should show text display, hide table
+        assert not widget.table_widget.isVisible()
+        assert widget.text_display_box.isVisible()
+
+        widget.close()
+
+    def test_reset_view_translation(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test reset_view with TRANSLATION mode"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget.show()  # Show the widget so visibility checks work
+
+        widget.view_mode = ViewMode.TRANSLATION
+        widget.reset_view()
+
+        # Should show text display, hide table
+        assert not widget.table_widget.isVisible()
+        assert widget.text_display_box.isVisible()
+
+        widget.close()
+
+    def test_on_timestamp_being_edited(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_timestamp_being_edited method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Without looping enabled
+        widget.segment_looping_enabled = False
+        widget.on_timestamp_being_edited(0, 0, 1000)
+
+        # With looping enabled
+        widget.segment_looping_enabled = True
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+        widget.on_timestamp_being_edited(0, 2, 1000)
+
+        # Should not crash
+        assert hasattr(widget, 'on_timestamp_being_edited')
+
+        widget.close()
+
+    def test_on_scroll_to_current_button_clicked_with_segments(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_scroll_to_current_button_clicked with multiple segments"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Set audio position to second segment
+        widget.audio_player.set_position(600)
+        widget.on_scroll_to_current_button_clicked()
+
+        # Should not crash
+        assert hasattr(widget, 'on_scroll_to_current_button_clicked')
+
+        widget.close()
+
+    def test_auto_scroll_to_current_position(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test auto_scroll_to_current_position method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.view_mode = ViewMode.TIMESTAMPS
+        widget.audio_player.set_position(600)
+        widget.auto_scroll_to_current_position()
+
+        # Should not crash
+        assert hasattr(widget, 'auto_scroll_to_current_position')
+
+        widget.close()
+
+    def test_resize_event(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test resizeEvent method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        from PyQt6.QtGui import QResizeEvent
+        from PyQt6.QtCore import QSize
+
+        event = QResizeEvent(QSize(1000, 800), QSize(800, 600))
+        widget.resizeEvent(event)
+
+        # Should not crash
+        assert hasattr(widget, 'resizeEvent')
+
+        widget.close()
+
+    def test_close_event(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test closeEvent method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        from PyQt6.QtGui import QCloseEvent
+        event = QCloseEvent()
+
+        widget.closeEvent(event)
+
+        # Should clean up resources
+        assert hasattr(widget, 'closeEvent')
+
+    def test_save_geometry(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test save_geometry method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.save_geometry()
+
+        # Should save to settings
+        assert hasattr(widget, 'save_geometry')
+
+        widget.close()
+
+    def test_load_geometry(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test load_geometry method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.load_geometry()
+
+        # Should load from settings
+        assert hasattr(widget, 'load_geometry')
+
+        widget.close()
+
+    def test_load_preferences(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test load_preferences method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        preferences = widget.load_preferences()
+
+        # Should return preferences object
+        assert preferences is not None
+
+        widget.close()
+
+    def test_open_advanced_settings(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test open_advanced_settings method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.open_advanced_settings()
+
+        # Should show dialog
+        assert hasattr(widget, 'open_advanced_settings')
+
+        widget.close()
+
+    def test_on_transcription_options_changed(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_transcription_options_changed method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        mock_options = MagicMock()
+        widget.on_transcription_options_changed(mock_options)
+
+        # Should update transcription options
+        assert widget.transcription_options == mock_options
+
+        widget.close()
+
+    def test_on_translate_button_clicked_no_api_key(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_translate_button_clicked without API key"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.openai_access_token = ""
+
+        # Mock QMessageBox to prevent blocking dialog
+        with patch('buzz.widgets.transcription_viewer.transcription_viewer_widget.QMessageBox.information') as mock_msgbox:
+            widget.on_translate_button_clicked()
+
+            # Should show message box
+            mock_msgbox.assert_called_once()
+            # Verify the message contains API key information
+            call_args = mock_msgbox.call_args
+            assert _("API Key Required") in call_args[0] or "API Key Required" in str(call_args)
+
+        widget.close()
+
+    @patch('openai.OpenAI')
+    def test_run_translation(self, mock_openai, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test run_translation method"""
+        mock_openai.return_value.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="Translated text"))]
+        )
+
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Set required options
+        widget.transcription_options.llm_model = "gpt-4"
+        widget.transcription_options.llm_prompt = "Translate"
+
+        widget.run_translation()
+
+        # Should enqueue translation tasks
+        assert hasattr(widget, 'run_translation')
+
+        widget.close()
+
+    def test_restore_ui_state(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test restore_ui_state method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.restore_ui_state()
+
+        # Should restore UI elements
+        assert hasattr(widget, 'restore_ui_state')
+
+        widget.close()
+
+    def test_create_search_bar(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test create_search_bar method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Should create search bar elements
+        assert hasattr(widget, 'search_frame')
+        assert hasattr(widget, 'search_input')
+        assert hasattr(widget, 'search_prev_button')
+        assert hasattr(widget, 'search_next_button')
+        assert hasattr(widget, 'clear_search_button')
+
+        widget.close()
+
+    def test_create_loop_controls(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test create_loop_controls method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Should create loop control elements
+        assert hasattr(widget, 'loop_controls_frame')
+        assert hasattr(widget, 'loop_toggle')
+        assert hasattr(widget, 'follow_audio_toggle')
+        assert hasattr(widget, 'speed_combo')
+        assert hasattr(widget, 'speed_down_btn')
+        assert hasattr(widget, 'speed_up_btn')
+        assert hasattr(widget, 'scroll_to_current_button')
+
+        widget.close()
+
+    # This is passing locally, may fail on CI
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="Skipping on Windows")
+    def test_on_follow_audio_toggle_changed_enabled(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_follow_audio_toggle_changed when enabled"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.on_follow_audio_toggle_changed(True)
+
+        # Should enable follow audio
+        assert widget.follow_audio_enabled == True
+
+        widget.close()
+
+    # This is passing locally, may fail on CI
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="Skipping on Windows")
+    def test_on_follow_audio_toggle_changed_disabled(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test on_follow_audio_toggle_changed when disabled"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        widget.on_follow_audio_toggle_changed(False)
+
+        # Should disable follow audio
+        assert widget.follow_audio_enabled == False
+
+        widget.close()
+
+    def test_hide_loop_controls(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test hide_loop_controls method"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget.show()
+
+        widget.show_loop_controls()
+        assert widget.loop_controls_frame.isVisible()
+
+        widget.hide_loop_controls()
+        assert not widget.loop_controls_frame.isVisible()
+        assert widget.playback_controls_visible is False
+
+        widget.close()
+
+    def test_toggle_playback_controls_visibility_hide(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test toggle_playback_controls_visibility hides controls when visible"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget.show()
+
+        widget.show_loop_controls()
+        assert widget.loop_controls_frame.isVisible()
+
+        widget.toggle_playback_controls_visibility()
+        assert not widget.loop_controls_frame.isVisible()
+
+        widget.close()
+
+    def test_toggle_audio_playback_when_playing(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Test toggle_audio_playback pauses when playing"""
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+
+        # Mock media player in playing state
+        with patch.object(
+            widget.current_media_player.media_player,
+            'playbackState',
+            return_value=QMediaPlayer.PlaybackState.PlayingState
+        ):
+            # Should call pause
+            with patch.object(widget.current_media_player.media_player, 'pause') as mock_pause:
+                widget.toggle_audio_playback()
+                mock_pause.assert_called_once()
+
+        widget.close()
+
+    def test_video_player_initialization(self, qtbot: QtBot, transcription_dao, transcription_segment_dao, transcription_service, shortcuts):
+        """Test widget initialization with video file - verifies video player code path"""
+        import uuid as uuid_mod
+        from buzz.db.entity.transcription import Transcription
+        from buzz.db.entity.transcription_segment import TranscriptionSegment
+        from buzz.model_loader import ModelType, WhisperModelSize
+        from buzz.transcriber.transcriber import Task
+
+        id = uuid_mod.uuid4()
+        transcription_dao.insert(
+            Transcription(
+                id=str(id),
+                status="completed",
+                file="/fake/video.mp4",
+                task=Task.TRANSCRIBE.value,
+                model_type=ModelType.WHISPER.value,
+                whisper_model_size=WhisperModelSize.TINY.value,
+            )
+        )
+        transcription_segment_dao.insert(
+            TranscriptionSegment(0, 500, "Test segment", "", str(id))
+        )
+        transcription = transcription_dao.find_by_id(str(id))
+
+        # Patch is_video_file to return True; let VideoPlayer construct normally
+        # (it won't load media but the widget will be created)
+        with patch('buzz.widgets.transcription_viewer.transcription_viewer_widget.is_video_file', return_value=True):
+            widget = TranscriptionViewerWidget(
+                transcription, transcription_service, shortcuts
+            )
+            qtbot.add_widget(widget)
+
+            # Video player should have been created and set as current
+            assert widget.is_video is True
+            assert widget.video_player is not None
+            assert widget.current_media_player == widget.video_player
+
+            widget.close()
+
+    # ------------------------------------------------------------------
+    # Search navigation
+    # ------------------------------------------------------------------
+
+    def test_on_search_text_changed_debounces_long_text(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Typing >= 2 chars starts the debounce timer and shows the search bar."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.on_search_text_changed("seg")
+
+        assert widget.search_text == "seg"
+        assert widget.search_debounce_timer.isActive()
+        # show() was requested on the frame (not hidden explicitly)
+        assert not widget.search_frame.isHidden()
+
+        widget.close()
+
+    def test_on_search_text_changed_empty_clears(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Clearing the input stops the timer and resets search state."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.search_results = [("table", 0, None)]
+        widget.on_search_text_changed("")
+
+        assert widget.search_text == ""
+        assert not widget.search_debounce_timer.isActive()
+        assert widget.search_results == []
+
+        widget.close()
+
+    def test_search_next_wraps_around(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """search_next advances the index and wraps back to the start."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.search_results = [("table", 0, None), ("table", 1, None)]
+        widget.current_search_index = 0
+
+        widget.search_next()
+        assert widget.current_search_index == 1
+
+        # Wrap around back to 0
+        widget.search_next()
+        assert widget.current_search_index == 0
+
+        widget.close()
+
+    def test_search_previous_wraps_around(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """search_previous decrements the index and wraps to the end."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.search_results = [("table", 0, None), ("table", 1, None)]
+        widget.current_search_index = 0
+
+        widget.search_previous()
+        assert widget.current_search_index == 1
+
+        widget.close()
+
+    def test_search_next_if_results_noop_when_empty(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """The *_if_results helpers do nothing when there are no results."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.search_results = []
+        widget.current_search_index = 0
+
+        widget.search_next_if_results()
+        widget.search_previous_if_results()
+
+        assert widget.current_search_index == 0
+
+        widget.close()
+
+    def test_clear_search_resets_state(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """clear_search empties results and disables navigation buttons."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.search_text = "segment"
+        widget.search_results = [("table", 0, None)]
+        widget.search_prev_button.setEnabled(True)
+        widget.search_next_button.setEnabled(True)
+
+        widget.clear_search()
+
+        assert widget.search_text == ""
+        assert widget.search_results == []
+        assert not widget.search_prev_button.isEnabled()
+        assert not widget.search_next_button.isEnabled()
+
+        widget.close()
+
+    def test_hide_search_bar(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """hide_search_bar hides the frame and syncs the find button state."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+        widget.show()
+
+        widget.show_search_bar()
+        assert widget.search_frame.isVisible()
+
+        widget.hide_search_bar()
+
+        assert not widget.search_frame.isVisible()
+        assert not widget.find_button.isChecked()
+        assert widget.find_widget_visible is False
+
+        widget.close()
+
+    def test_focus_search_input_toggles(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """focus_search_input shows the bar when hidden and hides it when shown."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+        widget.show()
+
+        # Hidden -> shown
+        widget.search_frame.hide()
+        widget.focus_search_input()
+        assert widget.search_frame.isVisible()
+        assert widget.find_widget_visible is True
+
+        # Shown -> hidden
+        widget.focus_search_input()
+        assert not widget.search_frame.isVisible()
+
+        widget.close()
+
+    def test_search_100_plus_matches_label(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """update_search_ui shows a "100+" label when the cap is hit."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.search_results = [("table", i, None) for i in range(100)]
+        widget.update_search_ui()
+
+        assert "100+" in widget.search_results_label.text()
+
+        widget.close()
+
+    # ------------------------------------------------------------------
+    # View mode / segment selection
+    # ------------------------------------------------------------------
+
+    def test_on_view_mode_changed(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """on_view_mode_changed updates the mode and refreshes the view."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+        widget.show()
+
+        widget.on_view_mode_changed(ViewMode.TEXT)
+
+        assert widget.view_mode == ViewMode.TEXT
+        assert widget.text_display_box.isVisible()
+
+        widget.close()
+
+    def test_on_segment_selected(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """on_segment_selected stores the segment and shows its text."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+        widget.show()
+
+        record = widget.table_widget.model().record(0)
+        widget.on_segment_selected(record)
+
+        # The highlight path may re-emit selection with a fresh QSqlRecord, so
+        # compare by id value rather than object identity.
+        assert widget.currently_selected_segment.value("id") == record.value("id")
+        assert not widget.current_segment_frame.isHidden()
+        assert widget.current_segment_text.text() == record.value("text")
+
+        widget.close()
+
+    def test_on_audio_player_position_ms_changed_updates_text(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Position changes update the current-segment text to the active segment."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+        widget.show()
+
+        # Position 600ms falls inside the second segment (500-1000, "Second segment")
+        widget.on_audio_player_position_ms_changed(600)
+
+        assert widget.current_segment_text.text() == "Second segment"
+
+        widget.close()
+
+    def test_on_audio_player_position_ms_changed_no_segment(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """A position outside all segments is a no-op (returns early)."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        before = widget.current_segment_text.text()
+        widget.on_audio_player_position_ms_changed(999999)
+
+        assert widget.current_segment_text.text() == before
+
+        widget.close()
+
+    # ------------------------------------------------------------------
+    # Loop toggle
+    # ------------------------------------------------------------------
+
+    def test_on_loop_toggle_changed_enable_with_selection(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Enabling looping with a selected segment sets a loop range."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.currently_selected_segment = widget.table_widget.model().record(0)
+
+        with patch.object(widget.current_media_player, 'set_range') as mock_range:
+            widget.on_loop_toggle_changed(True)
+
+            assert widget.segment_looping_enabled is True
+            assert mock_range.called
+
+        widget.close()
+
+    def test_on_loop_toggle_changed_disable_clears_range(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Disabling looping clears any existing loop range."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        with patch.object(widget.current_media_player, 'clear_range') as mock_clear:
+            widget.on_loop_toggle_changed(False)
+
+            assert widget.segment_looping_enabled is False
+            mock_clear.assert_called_once()
+
+        widget.close()
+
+    # ------------------------------------------------------------------
+    # Dialog launchers
+    # ------------------------------------------------------------------
+
+    def test_on_resize_button_clicked(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """The resize button constructs and shows the resizer dialog."""
+        updated_signal = MagicMock()
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts,
+            transcriptions_updated_signal=updated_signal,
+        )
+        qtbot.add_widget(widget)
+
+        with patch(
+            'buzz.widgets.transcription_viewer.transcription_viewer_widget.TranscriptionResizerWidget'
+        ) as mock_resizer:
+            widget.on_resize_button_clicked()
+
+            mock_resizer.assert_called_once()
+            widget.transcription_resizer_dialog.show.assert_called_once()
+
+        widget.close()
+
+    def test_on_speaker_identification_button_clicked(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """The identify-speakers button constructs and shows the dialog."""
+        import platform as _platform
+        if _platform.system() == "Darwin" and _platform.machine() == "x86_64":
+            pytest.skip("Speaker identification unavailable on Intel Mac")
+
+        updated_signal = MagicMock()
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts,
+            transcriptions_updated_signal=updated_signal,
+        )
+        qtbot.add_widget(widget)
+
+        with patch(
+            'buzz.widgets.transcription_viewer.transcription_viewer_widget.SpeakerIdentificationWidget'
+        ) as mock_dialog:
+            mock_dialog.get_active_running_instance.return_value = None
+            widget.on_speaker_identification_button_clicked()
+
+            mock_dialog.assert_called_once()
+            widget.speaker_identification_dialog.show.assert_called_once()
+
+        widget.close()
+
+    def test_on_speaker_identification_button_clicked_activates_running_dialog(
+        self, qtbot: QtBot, transcription, transcription_service, shortcuts
+    ):
+        """When identification runs in another window, that window is activated instead."""
+        import platform as _platform
+        if _platform.system() == "Darwin" and _platform.machine() == "x86_64":
+            pytest.skip("Speaker identification unavailable on Intel Mac")
+
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts,
+            transcriptions_updated_signal=MagicMock(),
+        )
+        qtbot.add_widget(widget)
+
+        running_dialog = MagicMock()
+        running_dialog.isMinimized.return_value = False
+        with patch(
+            'buzz.widgets.transcription_viewer.transcription_viewer_widget.SpeakerIdentificationWidget'
+        ) as mock_dialog, patch(
+            'buzz.widgets.transcription_viewer.transcription_viewer_widget.QApplication.beep'
+        ):
+            mock_dialog.get_active_running_instance.return_value = running_dialog
+            widget.on_speaker_identification_button_clicked()
+
+            mock_dialog.assert_not_called()
+            running_dialog.show.assert_called_once()
+            running_dialog.raise_.assert_called_once()
+            running_dialog.activateWindow.assert_called_once()
+
+        widget.close()
+
+    # ------------------------------------------------------------------
+    # Splitter sizes persistence
+    # ------------------------------------------------------------------
+
+    def test_save_and_load_splitter_sizes(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Splitter sizes round-trip through settings without error."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.media_splitter.setSizes([700, 300])
+        widget.save_splitter_sizes()
+        widget.load_splitter_sizes()
+
+        # Sizes are applied back onto the splitter
+        assert sum(widget.media_splitter.sizes()) > 0
+
+        widget.close()
+
+    def test_on_splitter_moved_schedules_save(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """Moving the splitter schedules a deferred save."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        with patch(
+            'buzz.widgets.transcription_viewer.transcription_viewer_widget.QTimer.singleShot'
+        ) as mock_single_shot:
+            widget.on_splitter_moved(100, 0)
+            mock_single_shot.assert_called_once()
+
+        widget.close()
+
+    def test_close_event_closes_child_dialogs(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+        """closeEvent closes any open child dialogs."""
+        widget = TranscriptionViewerWidget(transcription, transcription_service, shortcuts)
+        qtbot.add_widget(widget)
+
+        widget.transcription_resizer_dialog = MagicMock()
+        widget.speaker_identification_dialog = MagicMock()
+
+        from PyQt6.QtGui import QCloseEvent
+        widget.closeEvent(QCloseEvent())
+
+        widget.transcription_resizer_dialog.close.assert_called_once()
+        widget.speaker_identification_dialog.close.assert_called_once()

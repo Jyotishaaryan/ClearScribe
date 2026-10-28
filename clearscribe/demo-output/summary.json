@@ -1,0 +1,31 @@
+{
+  "files_processed": 2,
+  "total_words": 44,
+  "total_audio_seconds": 22.0,
+  "wall_time_seconds": 1.5,
+  "files": [
+    {
+      "file": "jfk-address-copy.mp3",
+      "duration_s": 11.0,
+      "words": 22,
+      "outputs": [
+        "jfk-address-copy.txt",
+        "jfk-address-copy.srt",
+        "jfk-address-copy.vtt",
+        "jfk-address-copy.md"
+      ]
+    },
+    {
+      "file": "jfk-address.flac",
+      "duration_s": 11.0,
+      "words": 22,
+      "outputs": [
+        "jfk-address.txt",
+        "jfk-address.srt",
+        "jfk-address.vtt",
+        "jfk-address.md"
+      ]
+    }
+  ],
+  "errors": []
+}

@@ -1,0 +1,563 @@
+import platform
+import os
+import re
+import sys
+import logging
+import shutil
+import subprocess
+import tempfile
+import json
+from typing import List, Optional
+from buzz.assets import APP_BASE_DIR
+from buzz.transcriber.transcriber import Segment, Task, FileTranscriptionTask
+from buzz.transcriber.file_transcriber import app_env
+
+
+IS_VULKAN_SUPPORTED = False
+try:
+    import vulkan
+
+    instance = vulkan.vkCreateInstance(vulkan.VkInstanceCreateInfo(), None)
+    vulkan.vkDestroyInstance(instance, None)
+    vulkan_version = vulkan.vkEnumerateInstanceVersion()
+    major = (vulkan_version >> 22) & 0x3FF
+    minor = (vulkan_version >> 12) & 0x3FF
+
+    logging.debug("Vulkan version = %s.%s", major, minor)
+
+    # On macOS, default whisper_cpp is compiled with CoreML (Apple Silicon) or Vulkan (Intel).
+    if platform.system() in ("Linux", "Windows") and ((major > 1) or (major == 1 and minor >= 2)):
+        IS_VULKAN_SUPPORTED = True
+
+except (ImportError, Exception) as e:
+    logging.debug(f"Vulkan import error: {e}")
+
+    IS_VULKAN_SUPPORTED = False
+
+
+def get_whisper_cli_path() -> str:
+    """Return the path to the bundled whisper-cli executable."""
+    cli_executable = "whisper-cli.exe" if sys.platform == "win32" else "whisper-cli"
+    whisper_cli_path = os.path.join(APP_BASE_DIR, "whisper_cpp", cli_executable)
+
+    # If running Mac and Windows installed version
+    if not os.path.exists(whisper_cli_path):
+        whisper_cli_path = os.path.join(APP_BASE_DIR, "buzz", "whisper_cpp", cli_executable)
+
+    return whisper_cli_path
+
+
+def _is_cli_safe_path(path: str, encoding: Optional[str] = None) -> bool:
+    """Whether whisper-cli can open ``path`` when given it on the command line.
+
+    whisper-cli reads its arguments through a narrow ``main(argc, argv)``, so on
+    Windows they reach it in the system ANSI code page (e.g. cp932 on Japanese
+    Windows). Characters that code page can't represent are mangled and
+    whisper-cli exits with "input file not found" (return code 2).
+    """
+    if encoding is None:
+        if sys.platform != "win32":
+            return True
+        encoding = "mbcs"
+    try:
+        path.encode(encoding)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _make_temp_path(suffix: str) -> str:
+    """Create an empty temp file with an ASCII name and return its path."""
+    fd, path = tempfile.mkstemp(prefix="buzz-", suffix=suffix)
+    os.close(fd)
+    return path
+
+
+def _make_offset_mapper(segment_data, vad_enabled):
+    """Return a function mapping a token offset to original audio time."""
+    if not vad_enabled:
+        return lambda offset: offset
+
+    token_offsets = [
+        (
+            int(t.get("offsets", {}).get("from", 0)),
+            int(t.get("offsets", {}).get("to", 0)),
+        )
+        for t in segment_data.get("tokens", [])
+        if not t.get("text", "").startswith("[_")
+    ]
+    if not token_offsets:
+        return lambda offset: offset
+
+    vad_min = min(start for start, _ in token_offsets)
+    vad_max = max(end for _, end in token_offsets)
+    orig_from = int(segment_data.get("offsets", {}).get("from", 0))
+    orig_to = int(segment_data.get("offsets", {}).get("to", 0))
+
+    span = vad_max - vad_min
+    if span <= 0:
+        return lambda offset: orig_from
+
+    scale = (orig_to - orig_from) / span
+    return lambda offset: int(orig_from + (offset - vad_min) * scale)
+
+
+def _flush_complete_chars(buffer: bytes, start: int, end: int, segments: list) -> bytes:
+    """Extract and output all complete UTF-8 characters from buffer.
+    Returns any remaining incomplete bytes."""
+    remaining = buffer
+    pos = 0
+
+    while pos < len(remaining):
+        for char_len in range(1, min(5, len(remaining) - pos + 1)):
+            try:
+                char = remaining[pos:pos + char_len].decode("utf-8")
+                if char.strip():
+                    segments.append(
+                        Segment(
+                            start=start,
+                            end=end,
+                            text=char,
+                            translation=""
+                        )
+                    )
+                pos += char_len
+                break
+            except UnicodeDecodeError:
+                if char_len == 4 or pos + char_len >= len(remaining):
+                    return remaining[pos:]
+        else:
+            return remaining[pos:]
+
+    return b""
+
+
+def _append_word(buffer: bytes, start: int, end: int, segments: list) -> bool:
+    """Try to decode and append a word segment, handling multi-byte UTF-8"""
+    if not buffer:
+        return True
+
+    try:
+        text = buffer.decode("utf-8").strip()
+        if text:
+            segments.append(
+                Segment(
+                    start=start,
+                    end=end,
+                    text=text,
+                    translation=""
+                )
+            )
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+class WhisperCpp:
+    @staticmethod
+    def _convert_to_wav(file_path: str) -> str:
+        """Convert audio file to WAV format using ffmpeg."""
+        # Use an ASCII temp name rather than one derived from file_path,
+        # so whisper-cli can open it on Windows (see _is_cli_safe_path).
+        temp_file = _make_temp_path(".wav")
+        logging.info(f"Converting {file_path} to WAV format")
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-i", file_path,
+            "-ar", "16000",
+            "-ac", "1",
+            "-y",
+            temp_file
+        ]
+
+        try:
+            if sys.platform == "win32":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                subprocess.run(
+                    ffmpeg_cmd,
+                    capture_output=True,
+                    startupinfo=si,
+                    env=app_env,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    check=True
+                )
+            else:
+                subprocess.run(ffmpeg_cmd, capture_output=True, check=True)
+
+            return temp_file
+        except subprocess.CalledProcessError as e:
+            WhisperCpp._cleanup_files(temp_file, None)
+            raise Exception(f"Failed to convert audio file: {e.stderr.decode()}")
+        except FileNotFoundError:
+            WhisperCpp._cleanup_files(temp_file, None)
+            raise Exception("ffmpeg not found. Please install ffmpeg to process this audio format.")
+
+    @staticmethod
+    def _prepare_input(file_path: str, supported_formats: tuple) -> tuple:
+        """Return (path to give whisper-cli, temp file to clean up or None).
+
+        Formats whisper-cli can't read are converted to WAV. Readable files
+        whose path whisper-cli can't open are copied to an ASCII temp name.
+        """
+        file_ext = os.path.splitext(file_path)[1].lower()
+
+        if file_ext not in supported_formats:
+            temp_file = WhisperCpp._convert_to_wav(file_path)
+            return temp_file, temp_file
+
+        if not _is_cli_safe_path(file_path):
+            temp_file = _make_temp_path(file_ext)
+            logging.info(f"Copying {file_path} to {temp_file} for whisper-cli")
+            try:
+                shutil.copyfile(file_path, temp_file)
+            except Exception:
+                WhisperCpp._cleanup_files(temp_file, None)
+                raise
+            return temp_file, temp_file
+
+        return file_path, None
+
+    @staticmethod
+    def _build_command(task, file_to_process, language, vad_enabled) -> list:
+        """Build the whisper-cli command line."""
+        cmd = [
+            get_whisper_cli_path(),
+            "--model", task.model_path,
+            "--language", language,
+            "--print-progress",
+            "--suppress-nst",
+            "--max-context", "0",
+            "--entropy-thold", "2.8",
+            "--output-json-full",
+            "--threads", str(os.getenv("BUZZ_WHISPERCPP_N_THREADS", (os.cpu_count() or 8) // 2)),
+            "-f", file_to_process,
+        ]
+
+        if vad_enabled:
+            vad_model_path = os.path.join(
+                os.path.dirname(get_whisper_cli_path()), "ggml-silero-v6.2.0.bin"
+            )
+            cmd.extend(["--vad", "--vad-model", vad_model_path])
+
+        if task.transcription_options.task == Task.TRANSLATE:
+            cmd.extend(["--translate"])
+
+        force_cpu = os.getenv("BUZZ_FORCE_CPU", "false")
+        if force_cpu != "false" or (not IS_VULKAN_SUPPORTED and platform.system() != "Darwin"):
+            cmd.extend(["--no-gpu"])
+
+        print(f"Running Whisper CLI: {' '.join(cmd)}")
+        return cmd
+
+    @staticmethod
+    def _run_whisper(cmd) -> tuple:
+        """Run whisper-cli subprocess, returning (return code, tail of stderr)."""
+        if sys.platform == "win32":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                startupinfo=si,
+                env=app_env,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        else:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+        stderr_tail = []
+        for line in iter(process.stderr.readline, ''):
+            sys.stderr.write(line)
+            stderr_tail.append(line)
+            del stderr_tail[:-20]
+
+        process.wait()
+        return process.returncode, "".join(stderr_tail)
+
+    @staticmethod
+    def _read_json_output(file_to_process: str) -> dict:
+        """Read the JSON output file generated by whisper-cli."""
+        json_output_path = f"{file_to_process}.json"
+        with open(json_output_path, 'r', encoding='latin-1') as f:
+            return json.load(f)
+
+    @staticmethod
+    def _parse_word_level_timings(result, language, vad_enabled) -> list:
+        """Parse word-level timings from whisper-cli JSON output."""
+        segments = []
+        transcription = result.get("transcription", [])
+        non_space_languages = {"zh", "ja", "th", "lo", "km", "my"}
+        is_non_space_language = language in non_space_languages
+
+        # Filter out bogus / uncommitted chunk fragments superseded by a subsequent chunk
+        valid_transcription = []
+        for i, segment_data in enumerate(transcription):
+            start = int(segment_data.get("offsets", {}).get("from", 0))
+            end = int(segment_data.get("offsets", {}).get("to", 0))
+            if end <= start:
+                continue
+            if i + 1 < len(transcription):
+                next_start = int(transcription[i + 1].get("offsets", {}).get("from", 0))
+                if next_start <= start or (end - start <= 150 and start == next_start):
+                    continue
+            valid_transcription.append(segment_data)
+
+        for segment_data in valid_transcription:
+            tokens = segment_data.get("tokens", [])
+            map_offset = _make_offset_mapper(segment_data, vad_enabled)
+
+            if is_non_space_language:
+                char_buffer = b""
+                char_start = 0
+                char_end = 0
+
+                for token_data in tokens:
+                    token_text = token_data.get("text", "")
+
+                    if token_text.startswith("[_") or not token_text:
+                        continue
+
+                    token_start = map_offset(int(token_data.get("offsets", {}).get("from", 0)))
+                    token_end = map_offset(int(token_data.get("offsets", {}).get("to", 0)))
+
+                    token_bytes = token_text.encode("latin-1")
+
+                    if not char_buffer:
+                        char_start = token_start
+
+                    char_buffer += token_bytes
+                    char_end = token_end
+
+                    char_buffer = _flush_complete_chars(char_buffer, char_start, char_end, segments)
+
+                    if not char_buffer:
+                        char_start = token_end
+
+                if char_buffer:
+                    _flush_complete_chars(char_buffer, char_start, char_end, segments)
+            else:
+                word_buffer = b""
+                word_start = 0
+                word_end = 0
+
+                for token_data in tokens:
+                    token_text = token_data.get("text", "")
+
+                    if token_text.startswith("[_") or not token_text:
+                        continue
+
+                    token_p = token_data.get("p", 1.0)
+                    if token_p < 0.01:
+                        continue
+
+                    token_start = map_offset(int(token_data.get("offsets", {}).get("from", 0)))
+                    token_end = map_offset(int(token_data.get("offsets", {}).get("to", 0)))
+
+                    token_bytes = token_text.encode("latin-1")
+
+                    if token_bytes.startswith(b" ") and word_buffer:
+                        _append_word(word_buffer, word_start, word_end, segments)
+                        word_buffer = token_bytes
+                        word_start = token_start
+                        word_end = token_end
+                    elif token_bytes.startswith(b", "):
+                        word_buffer += b","
+                        _append_word(word_buffer, word_start, word_end, segments)
+                        word_buffer = token_bytes.lstrip(b",")
+                        word_start = token_start
+                        word_end = token_end
+                    else:
+                        if not word_buffer:
+                            word_start = token_start
+                        word_buffer += token_bytes
+                        word_end = token_end
+
+                if not _append_word(word_buffer, word_start, word_end, segments):
+                    text = word_buffer.decode("utf-8", errors="replace").rstrip("\ufffd").strip()
+                    if text:
+                        segments.append(Segment(start=word_start, end=word_end, text=text, translation=""))
+
+        return segments
+
+    @staticmethod
+    def _parse_segment_timings(result) -> list:
+        """Parse segment-level timings from whisper-cli JSON output."""
+        segments = []
+        transcription = result.get("transcription", [])
+        for segment_data in transcription:
+            segment_text_latin1 = segment_data.get("text", "")
+            try:
+                segment_text = segment_text_latin1.encode("latin-1").decode("utf-8").strip()
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                try:
+                    raw_bytes = segment_text_latin1.encode("latin-1", errors="replace")
+                    segment_text = raw_bytes.decode("utf-8", errors="replace").rstrip("\ufffd").strip()
+                except Exception:
+                    segment_text = segment_text_latin1.strip()
+
+            start = int(segment_data.get("offsets", {}).get("from", 0))
+            end = int(segment_data.get("offsets", {}).get("to", 0))
+
+            if not segment_text or end <= start:
+                continue
+
+            segments.append(
+                Segment(
+                    start=start,
+                    end=end,
+                    text=segment_text,
+                    translation=""
+                )
+            )
+
+        # Filter out superseded / aborted chunk fragments
+        filtered_segments: List[Segment] = []
+        for i, seg in enumerate(segments):
+            if i + 1 < len(segments):
+                next_seg = segments[i + 1]
+                if next_seg.start <= seg.start or (seg.end - seg.start <= 150 and seg.start == next_seg.start):
+                    continue
+            filtered_segments.append(seg)
+        return filtered_segments
+
+    @staticmethod
+    def _cleanup_files(temp_file, json_output_path):
+        """Clean up temporary files."""
+        if json_output_path and os.path.exists(json_output_path):
+            try:
+                os.remove(json_output_path)
+            except Exception as e:
+                print(f"Failed to remove JSON output file {json_output_path}: {e}")
+
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception as e:
+                print(f"Failed to remove temporary file {temp_file}: {e}")
+
+    @staticmethod
+    def transcribe(task: FileTranscriptionTask) -> List[Segment]:
+        """Transcribe audio using whisper-cli subprocess."""
+        language = (
+            task.transcription_options.language
+            if task.transcription_options.language is not None
+            else "auto"
+        )
+
+        file_to_process, temp_file = WhisperCpp._prepare_input(
+            task.file_path, ('.mp3', '.wav', '.flac')
+        )
+
+        vad_model_path = os.path.join(
+            os.path.dirname(get_whisper_cli_path()), "ggml-silero-v6.2.0.bin"
+        )
+        vad_enabled = os.path.exists(vad_model_path)
+
+        cmd = WhisperCpp._build_command(task, file_to_process, language, vad_enabled)
+        return_code, stderr_tail = WhisperCpp._run_whisper(cmd)
+
+        if return_code != 0:
+            WhisperCpp._cleanup_files(temp_file, None)
+            message = f"whisper-cli failed with return code {return_code}"
+            if stderr_tail.strip():
+                message = f"{message}\n{stderr_tail.strip()}"
+            raise Exception(message)
+
+        try:
+            result = WhisperCpp._read_json_output(file_to_process)
+            if task.transcription_options.word_level_timings:
+                segments = WhisperCpp._parse_word_level_timings(
+                    result, language, vad_enabled
+                )
+            else:
+                segments = WhisperCpp._parse_segment_timings(result)
+            return segments
+        finally:
+            json_output_path = f"{file_to_process}.json"
+            WhisperCpp._cleanup_files(temp_file, json_output_path)
+
+    @staticmethod
+    def detect_language(file_path: str, model_path: str) -> Optional[str]:
+        """Detect the spoken language of an audio file using whisper-cli.
+
+        Runs whisper-cli with ``--detect-language`` which exits right after
+        detecting the language (much faster than a full transcription). Returns
+        the detected language code (e.g. ``"en"``) or ``None`` if detection
+        failed.
+        """
+        whisper_cli_path = get_whisper_cli_path()
+
+        # whisper-cli reads flac, mp3, ogg and wav directly. Convert anything
+        # else to WAV first, mirroring transcribe().
+        file_to_process, temp_file = WhisperCpp._prepare_input(
+            file_path, ('.mp3', '.wav', '.flac', '.ogg')
+        )
+
+        cmd = [
+            whisper_cli_path,
+            "--model", model_path,
+            "--detect-language",
+            "-f", file_to_process,
+        ]
+
+        # Force CPU if specified (mirrors transcribe()).
+        force_cpu = os.getenv("BUZZ_FORCE_CPU", "false")
+        if force_cpu != "false" or (not IS_VULKAN_SUPPORTED and platform.system() != "Darwin"):
+            cmd.extend(["--no-gpu"])
+
+        print(f"Running Whisper CLI language detection: {' '.join(cmd)}")
+
+        try:
+            if sys.platform == "win32":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    startupinfo=si,
+                    env=app_env,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+            # whisper-cli writes the detection line to stderr, e.g.:
+            #   whisper_full_with_state: auto-detected language: fr (p = 0.99)
+            output = (result.stderr or "") + (result.stdout or "")
+            match = re.search(r"auto-detected language:\s*([a-zA-Z]{2,3})", output)
+            if match:
+                return match.group(1).lower()
+
+            logging.warning("Language detection produced no result")
+            return None
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception as e:
+                    print(f"Failed to remove temporary file {temp_file}: {e}")
